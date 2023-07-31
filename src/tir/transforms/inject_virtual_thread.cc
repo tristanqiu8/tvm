@@ -50,9 +50,6 @@ class ExprTouched final : public StmtExprVisitor {
     if (expr_touched_ && !check_write_) return;
     StmtExprVisitor::VisitStmt(n);
   }
-  void VisitExpr_(const LoadNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
-  }
   void VisitExpr_(const BufferLoadNode* op) final {
     HandleUseVar(op->buffer->data.get());
     StmtExprVisitor::VisitExpr_(op);
@@ -104,10 +101,6 @@ class VarTouchedAnalysis : public StmtVisitor {
     tc(op->value);
     Record(op->var.get(), tc);
     this->VisitStmt(op->body);
-  }
-
-  void VisitStmt_(const StoreNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
   }
 
   void VisitStmt_(const BufferStoreNode* op) final {
@@ -244,16 +237,6 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
     trigger_base_inject_ = !allow_share_;
     return StmtExprMutator::VisitStmt_(op);
   }
-  // Load
-  PrimExpr VisitExpr_(const LoadNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
-    return PrimExpr();
-  }
-  // Store
-  Stmt VisitStmt_(const StoreNode* op) final {
-    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
-    return Stmt();
-  }
   // BufferLoad
   PrimExpr VisitExpr_(const BufferLoadNode* op) final {
     auto node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
@@ -379,7 +362,6 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
   Stmt VisitStmt_(const WhileNode* op) final {
     // TODO(masahi): What should we do for While nodes?
     LOG(FATAL) << "WhileNode in InjectVirtualThread not supported yet";
-    return Stmt();
   }
 
   // Seq
@@ -464,8 +446,7 @@ class VTInjector : public arith::IRMutatorWithAnalyzer {
     } else {
       // insert a for loop
       Var idx(var_->name_hint + ".s", var_->dtype);
-      Map<Var, PrimExpr> values{{var_, idx}};
-      stmt = Substitute(stmt, values);
+      stmt = Substitute(stmt, {{var_, idx}});
       return For(idx, make_zero(idx.dtype()), make_const(idx.dtype(), num_threads_),
                  ForKind::kSerial, stmt);
     }
@@ -528,7 +509,6 @@ class VirtualThreadInjector : public arith::IRMutatorWithAnalyzer {
 
   Stmt VisitStmt_(const ProducerStoreNode* op) final {
     LOG(FATAL) << "Need to call StorageFlatten first";
-    return GetRef<Stmt>(op);
   }
 };
 

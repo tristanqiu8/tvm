@@ -23,6 +23,7 @@
 #include "codegen_c.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/name_supply.h>
 
 #include <cctype>
 #include <iomanip>
@@ -85,7 +86,8 @@ void CodeGenC::AddFunction(const PrimFunc& f) {
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
 
-  this->PrintFuncPrefix();
+  this->PrintFuncPrefix(stream);
+  PrintType(f->ret_type, stream);
   this->PrintExtraAttrs(f);
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
@@ -121,17 +123,14 @@ void CodeGenC::AddFunction(const PrimFunc& f) {
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
   this->PrintStmt(f->body);
-  this->PrintFinalReturn();
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
 }
 
-void CodeGenC::PrintFuncPrefix() { stream << "void"; }
+void CodeGenC::PrintFuncPrefix(std::ostream& os) {}
 
 void CodeGenC::PrintExtraAttrs(const PrimFunc& f) {}
-
-void CodeGenC::PrintFinalReturn() {}
 
 std::string CodeGenC::Finish() { return decl_stream.str() + stream.str(); }
 
@@ -525,8 +524,8 @@ void CodeGenC::PrintCallExtern(Type ret_type, String global_symbol, const Array<
 }
 
 void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
-  if (auto* ptr_op = op->op.as<OpNode>()) {
-    auto call_op = GetRef<Op>(ptr_op);
+  if (auto opt_call_op = op->op.as<Op>()) {
+    auto call_op = opt_call_op.value();
 
     if (op->op.same_as(builtin::tvm_check_return())) {
       const CallNode* call = op->args[2].as<CallNode>();
@@ -536,10 +535,19 @@ void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
       PrintExpr(op->args[0], os);
       os << " ) return ";
       PrintExpr(op->args[1], os);
+    } else if (op->op.same_as(builtin::ret())) {
+      os << "return ";
+      PrintExpr(op->args[0], os);
     } else if (op->op.same_as(builtin_call_extern_) || op->op.same_as(builtin_call_pure_extern_)) {
       ICHECK_GE(op->args.size(), 1U);
       auto func = Downcast<StringImm>(op->args[0]);
       this->PrintCallExtern(GetType(GetRef<PrimExpr>(op)), func->value, op->args, true, os);
+      Array<Type> arg_types;
+      for (size_t i = 1; i < op->args.size(); i++) {
+        arg_types.push_back(GetType(op->args[i]));
+      }
+      Type ret_type = GetTypeFromRuntimeDataType(op->dtype);
+      this->GenerateForwardFunctionDeclarations(func->value, arg_types, ret_type);
     } else if (op_attr_global_symbol_.count(call_op)) {
       // call extern if the op itself have a global symbol.
       this->PrintCallExtern(GetType(GetRef<PrimExpr>(op)), op_attr_global_symbol_[call_op],
@@ -631,7 +639,8 @@ void CodeGenC::PrintVecBinaryOp(const std::string& op, DataType t, PrimExpr lhs,
 }
 
 void CodeGenC::VisitStmt_(const AllocateConstNode* op) {
-  std::string symbol_name = op->buffer_var->name_hint;
+  std::string symbol_name = AllocVarID(op->buffer_var.get());
+
   int64_t num_elements = 1;
   const auto& data = op->data.value();
 
@@ -662,10 +671,6 @@ void CodeGenC::VisitStmt_(const AllocateConstNode* op) {
 }
 
 void CodeGenC::VisitStmt_(const DeclBufferNode* op) { this->PrintStmt(op->body); }
-
-void CodeGenC::VisitExpr_(const LoadNode* op, std::ostream& os) {  // NOLINT(*)
-  LOG(FATAL) << "Unexpected deprecated LoadNode.  Use BufferLoadNode instead.";
-}
 
 void CodeGenC::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLINT(*)
   ICHECK_EQ(op->indices.size(), 1) << "Load from non-flat memory not supported.";
@@ -724,10 +729,6 @@ void CodeGenC::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLI
       os << svalue_expr.str();
     }
   }
-}
-
-void CodeGenC::VisitStmt_(const StoreNode* op) {
-  LOG(FATAL) << "Unexpected deprecated StoreNode.  Use BufferStoreNode instead.";
 }
 
 void CodeGenC::VisitStmt_(const BufferStoreNode* op) {
@@ -799,15 +800,16 @@ void CodeGenC::VisitExpr_(const LetNode* op, std::ostream& os) {  // NOLINT(*)
 }
 
 void CodeGenC::VisitExpr_(const RampNode* op, std::ostream& os) {  // NOLINT(*)
-  // constraint of current logic
-  ICHECK_EQ(op->base.dtype(), DataType::Int(32));
-  os << "((int" << op->lanes << ")(";
+  // NOTE: C have comma expression so cannot use (int2)(v0, v1)
+  // instead should use int2(v0, v1)
+  PrintType(op->dtype, os);
+  os << "(";
   for (int i = 0; i < op->lanes; i++) {
     os << "(" << PrintExpr(op->base) << ")"
        << "+(" << PrintExpr(op->stride) << "*" << i << ")";
     if (i != op->lanes - 1) os << ", ";
   }
-  os << "))";
+  os << ")";
 }
 
 void CodeGenC::VisitExpr_(const ShuffleNode* op, std::ostream& os) {
@@ -996,9 +998,11 @@ void CodeGenC::PrintVecElemLoadExpr(DataType t, int i, const std::string& value,
   }
 
   if (i == 0) {
-    os << "((";
+    // NOTE: C have comma expression so cannot use (float2)(v0, v1)
+    // instead should use float2(v0, v1)
+    os << "(";
     PrintType(t, os);
-    os << ")(";
+    os << "(";
   }
   os << value;
   if (i != t.lanes() - 1) {

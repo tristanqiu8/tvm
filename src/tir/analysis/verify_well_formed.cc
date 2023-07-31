@@ -27,6 +27,7 @@
 #include <tvm/tir/stmt_functor.h>
 
 #include "../ir/functor_common.h"
+#include "tvm/ir/module.h"
 
 namespace tvm {
 namespace tir {
@@ -60,24 +61,39 @@ class BlockVarAccessVerifier : public StmtExprVisitor {
 
   void VisitExpr_(const VarNode* op) final {
     auto it = loop_vars_.find(op);
-    if (it != loop_vars_.end() && it->second < cur_block_level_) {
+    if (it != loop_vars_.end() && it->second < block_stack_.size()) {
       has_error_ = true;
       if (assert_mode_) {
-        report_error(op);
+        if (it->second == 0) {
+          LOG(FATAL) << "Well-formedness check failed: "
+                     << "Loop iterator var " << op->name_hint
+                     << " is defined outside of any block, "
+                     << "but is used inside the non-opaque current block \""
+                     << block_stack_.back()->name_hint << "\".";
+        } else {
+          LOG(FATAL) << "Well-formedness check failed: "
+                     << "Loop iterator var " << op->name_hint << " is defined in block \""
+                     << block_stack_[it->second - 1]->name_hint << "\", "
+                     << "but is used inside the non-opaque current block \""
+                     << block_stack_.back()->name_hint << "\".";
+        }
       }
     }
   }
 
   void VisitStmt_(const ForNode* op) final {
     ICHECK(loop_vars_.find(op->loop_var.get()) == loop_vars_.end());
-    loop_vars_[op->loop_var.get()] = cur_block_level_;
+    loop_vars_[op->loop_var.get()] = block_stack_.size();
     StmtExprVisitor::VisitStmt_(op);
     loop_vars_.erase(op->loop_var.get());
   }
 
   void VisitStmt_(const BlockNode* op) final {
     // Do not check boundary if it's a opaque block.
-    cur_block_level_ += !op->iter_vars.empty();
+    bool is_non_opaque = op->iter_vars.size();
+    if (is_non_opaque) {
+      block_stack_.push_back(op);
+    }
 
     // Step 0. Skip block iter var's domain
 
@@ -103,22 +119,18 @@ class BlockVarAccessVerifier : public StmtExprVisitor {
     }
     this->VisitStmt(op->body);
 
-    cur_block_level_ -= !op->iter_vars.empty();
+    if (is_non_opaque) {
+      block_stack_.pop_back();
+    }
   }
 
  private:
-  void report_error(const VarNode* var) {
-    // TODO(siyuan): use the error message from the parser.
-    LOG(FATAL) << "Well-formedness check failed: outside defined var " << var->name_hint
-               << " is used inside the current block.";
-  }
-
   /*! \brief The map from outside loop vars to its corresponding block level. */
   std::unordered_map<const VarNode*, size_t> loop_vars_;
   /*! \brief Whether it's in assert mode. */
   bool assert_mode_;
   /*! \brief Current nested block stack level. */
-  size_t cur_block_level_{0};
+  std::vector<const BlockNode*> block_stack_;
   /*! \brief Whether there is error. */
   bool has_error_{false};
 };
@@ -131,7 +143,29 @@ bool VerifyWellFormed(const PrimFunc& func, bool assert_mode) {
   return true;
 }
 
-TVM_REGISTER_GLOBAL("tir.analysis.VerifyWellFormed").set_body_typed(VerifyWellFormed);
+bool VerifyWellFormed(const IRModule& mod, bool assert_mode) {
+  for (const auto& [gvar, base_func] : mod->functions) {
+    if (auto prim_func = base_func.as<PrimFunc>()) {
+      bool res = VerifyWellFormed(prim_func.value(), assert_mode);
+      if (!res) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+TVM_REGISTER_GLOBAL("tir.analysis.VerifyWellFormed")
+    .set_body_typed([](const ObjectRef& obj, bool assert_mode) {
+      if (auto opt = obj.as<PrimFunc>()) {
+        return VerifyWellFormed(opt.value(), assert_mode);
+      } else if (auto opt = obj.as<IRModule>()) {
+        return VerifyWellFormed(opt.value(), assert_mode);
+      } else {
+        LOG(FATAL) << "Expected VerifyWellFormed argument to be a PrimFunc or IRModule, but found "
+                   << obj->GetTypeKey();
+      }
+    });
 
 }  // namespace tir
 }  // namespace tvm

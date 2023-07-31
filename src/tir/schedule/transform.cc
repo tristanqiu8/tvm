@@ -17,6 +17,7 @@
  * under the License.
  */
 
+#include "../transforms/ir_utils.h"
 #include "./utils.h"
 
 namespace tvm {
@@ -40,6 +41,16 @@ Buffer WithScope(const Buffer& buffer, const String& scope) {
   new_var->type_annotation = PointerType(ptr_type->element_type, scope);
   new_buffer->data = Var(new_var->name_hint + "_" + scope, new_var->type_annotation);
   new_buffer->name = buffer->name + "_" + scope;
+  return Buffer(new_buffer);
+}
+
+Buffer WithDType(const Buffer& buffer, const DataType& dtype) {
+  ObjectPtr<BufferNode> new_buffer = make_object<BufferNode>(*buffer.get());
+  new_buffer->dtype = dtype;
+  const auto* ptr_type = TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+  new_buffer->data =
+      Var(buffer->data->name_hint, PointerType(PrimType(dtype), ptr_type->storage_scope));
+  new_buffer->name = buffer->name;
   return Buffer(new_buffer);
 }
 
@@ -251,21 +262,28 @@ void LeafBlockRemovalPlan(const ScheduleState& self, const StmtSRef& leaf_block_
   if (const auto* block = sref->StmtAs<BlockNode>()) {
     auto body = block->body;
     // Peel off AllocateConst nodes at the beginning of the block body.
-    std::vector<const AllocateConstNode*> allocs;
-    while (const auto* alloc = body.as<AllocateConstNode>()) {
-      allocs.push_back(alloc);
-      body = alloc->body;
+    std::vector<Stmt> allocs;
+    while (true) {
+      if (auto opt = body.as<AllocateConst>()) {
+        auto alloc = opt.value();
+        body = alloc->body;
+        alloc.CopyOnWrite()->body = Evaluate(0);
+        allocs.push_back(alloc);
+      } else if (auto opt = body.as<DeclBuffer>()) {
+        auto decl_buffer = opt.value();
+        body = decl_buffer->body;
+        decl_buffer.CopyOnWrite()->body = Evaluate(0);
+        allocs.push_back(decl_buffer);
+      } else {
+        break;
+      }
     }
+
     if (const auto* seq = body.as<SeqStmtNode>()) {
       ObjectPtr<BlockNode> n = make_object<BlockNode>(*block);
       auto new_seq = RemoveFromSeqStmt(GetRef<SeqStmt>(seq), GetRef<Stmt>(last_stmt));
       // Re-attach AllocateConst nodes
-      auto new_body = new_seq;
-      for (int i = 0; i < static_cast<int>(allocs.size()); ++i) {
-        auto alloc = allocs[allocs.size() - 1 - i];
-        new_body = AllocateConst(alloc->buffer_var, alloc->dtype, alloc->extents, alloc->data,
-                                 new_body, alloc->annotations, alloc->span);
-      }
+      auto new_body = MergeNest(allocs, new_seq);
       n->body = new_body;
       *src_stmt = GetRef<Stmt>(block);
       *tgt_stmt = Stmt(std::move(n));
@@ -296,6 +314,19 @@ Optional<LoopRV> TileWithTensorIntrin(const tir::Schedule& sch, const tir::Block
   const tir::TensorizeInfoNode* info = opt_tensorize_info.value().get();
   if (info->block_iter_paddings.defined()) {
     sch->PadEinsum(block_rv, info->block_iter_paddings.value());
+    // Inline the producer and consumer padding blocks
+    auto producers = sch->GetProducers(block_rv);
+    for (const auto& producer : producers) {
+      auto original_producers = sch->GetProducers(producer);
+      ICHECK_EQ(original_producers.size(), 1u);
+      // Inline the original producer into the padding block. This ensures that the new producer
+      // has the padded shape.
+      sch->ComputeInline(original_producers[0]);
+    }
+    auto consumers = sch->GetConsumers(block_rv);
+    for (const auto& consumer : consumers) {
+      sch->ComputeInline(consumer);
+    }
   }
   // Construct a mapping from tir loops back to LoopRVs
   Map<tir::StmtSRef, LoopRV> loop2rv;
@@ -357,16 +388,17 @@ TVM_REGISTER_GLOBAL("tir.schedule.TileWithTensorIntrin").set_body_typed(TileWith
 /******** BlockBufferAccessSimplifier ********/
 void BlockBufferAccessSimplifier::SimplifyAccessRegion(Array<BufferRegion>* old_access_regions) {
   auto fmutate = [this](const BufferRegion& buffer_region) {
-    std::vector<Range> new_buffer_region;
+    Array<Range> new_buffer_region;
+    Array<PrimExpr> simplified_min;
     for (const auto& range : buffer_region->region) {
-      if (is_one(range->extent) && range->min->IsInstance<VarNode>()) {
-        new_buffer_region.push_back(Range::FromMinExtent(
-            SimplifyNonTrivialExpr(range->min, analyzer_), make_const(range->min.dtype(), 1)));
-      } else {
-        new_buffer_region.push_back(
-            Range::FromMinExtent(SimplifyNonTrivialExpr(range->min, analyzer_),
-                                 SimplifyNonTrivialExpr(range->extent, analyzer_)));
-      }
+      simplified_min.push_back(range->min);
+    }
+    simplified_min = this->IterMapSimplifyWithContext(simplified_min, true);
+    int n = buffer_region->region.size();
+    for (int i = 0; i < n; ++i) {
+      PrimExpr min = simplified_min[i];
+      PrimExpr extent = analyzer_->Simplify(buffer_region->region[i]->extent);
+      new_buffer_region.push_back(Range::FromMinExtent(min, extent));
     }
     return BufferRegion(buffer_region->buffer, new_buffer_region);
   };
@@ -374,8 +406,7 @@ void BlockBufferAccessSimplifier::SimplifyAccessRegion(Array<BufferRegion>* old_
 }
 
 void BlockBufferAccessSimplifier::SimplifyBufferIndices(Array<PrimExpr>* indices) {
-  (*indices).MutateByApply(
-      [this](const PrimExpr& expr) { return SimplifyNonTrivialExpr(expr, analyzer_); });
+  *indices = this->IterMapSimplifyWithContext(*indices, true);
 }
 
 Stmt BlockBufferAccessSimplifier::VisitStmt_(const BlockNode* op) {

@@ -17,10 +17,16 @@
 """Definition of Hexagon operator strategy."""
 # pylint: disable=unused-argument,wildcard-import,unused-wildcard-import
 
+import re
+
 from tvm import topi
 from .generic import *
 from ... import op as _op
 from ...op.strategy.generic import is_depthwise_conv2d
+
+
+NCHWC_MATCHER = re.compile("^NCHW[0-9]+c$")
+OIHWIOI_MATCHER = re.compile("^OIHW[0-9]+i[0-9]+o[0-9]+i$")
 
 
 @qnn_quantize_strategy.register("hexagon")
@@ -71,6 +77,42 @@ def qnn_add_strategy_hexagon(attrs, inputs, out_type, target):
     return strategy
 
 
+@qnn_subtract_strategy.register("hexagon")
+def qnn_subtract_strategy_hexagon(attrs, inputs, out_type, target):
+    """qnn.subtract strategy for Hexagon"""
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_topi_compute(topi.hexagon.qnn_subtract),
+        wrap_topi_schedule(topi.hexagon.schedule_qnn_subtract),
+        name="qnn_subtract.hexagon",
+    )
+    return strategy
+
+
+@qnn_mul_strategy.register("hexagon")
+def qnn_mul_strategy_hexagon(attrs, inputs, out_type, target):
+    """qnn.mul strategy for Hexagon"""
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_topi_compute(topi.hexagon.qnn_mul),
+        wrap_topi_schedule(topi.hexagon.schedule_qnn_mul),
+        name="qnn_mul.hexagon",
+    )
+    return strategy
+
+
+@qnn_tanh_strategy.register("hexagon")
+def qnn_tanh_strategy_hexagon(attrs, inputs, out_type, target):
+    """qnn.tanh strategy for Hexagon"""
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_topi_compute(topi.hexagon.qnn_tanh),
+        wrap_topi_schedule(topi.hexagon.schedule_qnn_tanh),
+        name="qnn_tanh.hexagon",
+    )
+    return strategy
+
+
 @qnn_concatenate_strategy.register("hexagon")
 def qnn_concatenate_strategy_hexagon(attrs, inputs, out_type, target):
     """qnn.concatenate strategy for Hexagon"""
@@ -99,6 +141,13 @@ def qnn_conv2d_strategy_hexagon(attrs, inputs, out_type, target):
                 wrap_topi_schedule(topi.hexagon.schedule_qnn_conv2d),
                 name="qnn_conv2d.hexagon",
             )
+        elif NCHWC_MATCHER.match(data_layout) and OIHWIOI_MATCHER.match(kernel_layout):
+            if data.dtype == "uint8" and kernel.dtype == "int8":
+                strategy.add_implementation(
+                    wrap_topi_qnn_conv2d(topi.hexagon.qnn_conv2d_NCHWc_int8),
+                    wrap_topi_schedule(topi.hexagon.schedule_qnn_conv2d_NCHWc_int8),
+                    name="qnn_conv2d_NCHWc_int8.hexagon",
+                )
     elif is_depthwise_conv2d(data.shape, data_layout, kernel.shape, kernel_layout, groups):
         if data_layout == "NCHW" and kernel_layout == "OIHW":
             strategy.add_implementation(
@@ -124,6 +173,24 @@ def qnn_dense_strategy_hexagon(attrs, inputs, out_type, target):
     return strategy
 
 
+@qnn_dense_pack_strategy.register("hexagon")
+def qnn_dense_pack_strategy_hexagon(attrs, inputs, out_type, target):
+    """qnn.contrib_dense_pack strategy for Hexagon"""
+    strategy = _op.OpStrategy()
+    if (
+        "uint8" in inputs[0].dtype
+        and "int8" in inputs[1].dtype
+        and attrs["weight_layout"] == "NC32n4c"
+    ):
+        # uint8 + uint8|int8 case
+        strategy.add_implementation(
+            wrap_topi_qnn_dense(topi.hexagon.qnn_dense_pack_vrmpy),
+            wrap_topi_schedule(topi.hexagon.schedule_qnn_dense_pack_vrmpy),
+            name="qnn_dense_pack_vrmpy.hexagon",
+        )
+    return strategy
+
+
 @qnn_batch_matmul_strategy.register("hexagon")
 def qnn_batch_matmul_strategy_hexagon(attrs, inputs, out_type, target):
     """qnn.batch_matmul strategy for Hexagon"""
@@ -134,3 +201,27 @@ def qnn_batch_matmul_strategy_hexagon(attrs, inputs, out_type, target):
         name="qnn_batch_matmul.hexagon",
     )
     return strategy
+
+
+@qnn_avg_pool2d_strategy.register(["hexagon"])
+def qnn_avg_pool2d_strategy_hexagon(attrs, inputs, out_type, target):
+    """qnn.avg_pool2d strategy for Hexagon"""
+    data_layout = attrs.layout
+    if data_layout == "NHWC":
+        strategy = _op.OpStrategy()
+        strategy.add_implementation(
+            wrap_compute_qnn_avg_pool2d(topi.hexagon.qnn.qnn_avg_pool2d_wrapper_compute_NHWC),
+            wrap_topi_schedule(topi.hexagon.qnn.schedule_qnn_avg_pool2d),
+            name="qnn_avg_pool2d.hexagon",
+        )
+        return strategy
+    elif data_layout == "NCHW":
+        strategy = _op.OpStrategy()
+        strategy.add_implementation(
+            wrap_compute_qnn_avg_pool2d(topi.hexagon.qnn.qnn_avg_pool2d_wrapper_compute_NCHW),
+            wrap_topi_schedule(topi.hexagon.qnn.schedule_qnn_avg_pool2d),
+            name="qnn_avg_pool2d.hexagon",
+        )
+        return strategy
+    else:
+        raise RuntimeError("Unsupported strategy for qnn.avg_pool2d")

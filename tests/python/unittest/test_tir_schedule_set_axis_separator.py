@@ -21,13 +21,16 @@ import tvm.testing
 from tvm import tir
 from tvm.tir import IndexMap
 from tvm.script import tir as T
-from tvm.tir.schedule.testing import verify_trace_roundtrip
+from tvm.tir.schedule.testing import (
+    assert_structural_equal_ignore_global_symbol,
+    verify_trace_roundtrip,
+)
 
 # fmt: off
 # pylint: disable=no-member,invalid-name,unused-variable,unexpected-keyword-arg
 
 @T.prim_func
-def element_wise(A: T.Buffer[(128, 128), "float32"], C: T.Buffer[(128, 128), "float32"]) -> None:
+def element_wise(A: T.Buffer((128, 128), "float32"), C: T.Buffer((128, 128), "float32")) -> None:
     B = T.alloc_buffer((128, 128), dtype="float32")
 
     for i, j in T.grid(128, 128):
@@ -41,7 +44,7 @@ def element_wise(A: T.Buffer[(128, 128), "float32"], C: T.Buffer[(128, 128), "fl
 
 
 @T.prim_func
-def element_wise_set_axis_separator(A: T.Buffer[(128, 128), "float32"], C: T.Buffer[(128, 128), "float32"]) -> None:
+def element_wise_set_axis_separator(A: T.Buffer((128, 128), "float32"), C: T.Buffer((128, 128), "float32")) -> None:
     B = T.alloc_buffer([128, 128], dtype="float32", axis_separators=[1])
 
     for i, j in T.grid(128, 128):
@@ -55,7 +58,7 @@ def element_wise_set_axis_separator(A: T.Buffer[(128, 128), "float32"], C: T.Buf
 
 
 @T.prim_func
-def element_wise_set_axis_separator_input_buffer(A: T.Buffer(shape=(128, 128), dtype="float32", axis_separators=(1,)), C: T.Buffer[(128, 128), "float32"]) -> None:
+def element_wise_set_axis_separator_input_buffer(A: T.Buffer(shape=(128, 128), dtype="float32", axis_separators=(1,)), C: T.Buffer((128, 128), "float32")) -> None:
     B = T.alloc_buffer([128, 128], dtype="float32")
 
     for i, j in T.grid(128, 128):
@@ -69,7 +72,7 @@ def element_wise_set_axis_separator_input_buffer(A: T.Buffer(shape=(128, 128), d
 
 
 @T.prim_func
-def element_wise_subregion_match(A: T.Buffer[(128, 128), "float32"], C: T.Buffer[(128, 128), "float32"]) -> None:
+def element_wise_subregion_match(A: T.Buffer((128, 128), "float32"), C: T.Buffer((128, 128), "float32")) -> None:
     B = T.alloc_buffer((128, 128), dtype="float32")
 
     for i, j in T.grid(128, 128):
@@ -85,7 +88,7 @@ def element_wise_subregion_match(A: T.Buffer[(128, 128), "float32"], C: T.Buffer
 
 
 @T.prim_func
-def element_wise_subregion_match_set_axis_separator(A: T.Buffer[(128, 128), "float32"], C: T.Buffer[(128, 128), "float32"]) -> None:
+def element_wise_subregion_match_set_axis_separator(A: T.Buffer((128, 128), "float32"), C: T.Buffer((128, 128), "float32")) -> None:
     B = T.alloc_buffer([128, 128], dtype="float32", axis_separators=[1])
 
     for i, j in T.grid(128, 128):
@@ -122,7 +125,7 @@ def test_set_axis_separator(argument_style):
     else:
         raise ValueError(f'Unexpected argument_style: {argument_style}')
 
-    tvm.ir.assert_structural_equal(element_wise_set_axis_separator, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(element_wise_set_axis_separator, s.mod["main"])
     verify_trace_roundtrip(sch=s, mod=func)
 
 
@@ -150,7 +153,7 @@ def test_set_axis_separator_input_buffer(argument_style):
         raise ValueError(f'Unexpected argument_style: {argument_style}')
 
 
-    tvm.ir.assert_structural_equal(element_wise_set_axis_separator_input_buffer, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(element_wise_set_axis_separator_input_buffer, s.mod["main"])
     verify_trace_roundtrip(sch=s, mod=func)
 
 
@@ -168,7 +171,7 @@ def test_set_axis_separator_subregion(argument_style):
     else:
         raise ValueError(f'Unexpected argument_style: {argument_style}')
 
-    tvm.ir.assert_structural_equal(element_wise_subregion_match_set_axis_separator, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(element_wise_subregion_match_set_axis_separator, s.mod["main"])
     verify_trace_roundtrip(sch=s, mod=func)
 
 class TestIndexedLookup(tvm.testing.CompareBeforeAfter):

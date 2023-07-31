@@ -19,6 +19,10 @@
 #include <tvm/ir/module.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/script/ir_builder/ir/ir.h>
+#include <tvm/tir/function.h>
+#include <tvm/tir/op.h>
+
+#include "./utils.h"
 
 namespace tvm {
 namespace script {
@@ -27,12 +31,62 @@ namespace ir {
 
 IRModuleFrame IRModule() {
   ObjectPtr<IRModuleFrameNode> n = make_object<IRModuleFrameNode>();
-  n->global_vars.clear();
+  n->global_var_map.clear();
   n->functions.clear();
   return IRModuleFrame(n);
 }
 
+GlobalVar DeclFunction(const String& func_name, const BaseFunc& func_signature) {
+  IRModuleFrame frame = FindModuleFrame("I.DeclFunction");
+  CHECK(!frame->global_var_map.count(func_name))
+      << "ValueError: function " << func_name << " already exists";
+
+  auto gvar_type = [&]() -> Type {
+    if (auto prim_func = func_signature.as<tir::PrimFuncNode>()) {
+      Array<Type> arg_types = prim_func->params.Map([](const auto& var) { return GetType(var); });
+      return FuncType(arg_types, prim_func->ret_type, {}, {});
+    }
+
+    return {};
+  }();
+
+  GlobalVar gv = GlobalVar(func_name, gvar_type);
+  CHECK(frame->functions.find(gv) == frame->functions.end())
+      << "ValueError: function " << func_name << " has already been defined.";
+  frame->global_var_map.Set(func_name, gv);
+  if (func_signature.defined()) {
+    frame->functions.Set(gv, func_signature);
+  }
+  return gv;
+}
+
+void DefFunction(const String& func_name, const BaseFunc& func) {
+  IRModuleFrame frame = FindModuleFrame("I.DefFunction");
+  auto it = frame->global_var_map.find(func_name);
+  CHECK(it != frame->global_var_map.end())
+      << "ValueError: function " << func_name << " does not exist, please declare it first.";
+  const GlobalVar& gv = (*it).second;
+  frame->functions.Set(gv, func);
+  if (func->checked_type_.defined()) {
+    gv->checked_type_ = func->checked_type_;
+  }
+}
+
+void ModuleAttrs(Map<String, ObjectRef> attrs) {
+  if (IRBuilder::IsInScope()) {
+    // TODO(hongyi): add comments to explain why we need to check if the module frame is in scope
+    IRModuleFrame frame = FindModuleFrame("I.ModuleAttr");
+    if (!frame->attrs.empty()) {
+      LOG(FATAL) << "ValueError: Duplicate module attrs, previous one is:\n" << frame->attrs;
+    }
+    frame->attrs = attrs;
+  }
+}
+
 TVM_REGISTER_GLOBAL("script.ir_builder.ir.IRModule").set_body_typed(IRModule);
+TVM_REGISTER_GLOBAL("script.ir_builder.ir.DeclFunction").set_body_typed(DeclFunction);
+TVM_REGISTER_GLOBAL("script.ir_builder.ir.DefFunction").set_body_typed(DefFunction);
+TVM_REGISTER_GLOBAL("script.ir_builder.ir.ModuleAttrs").set_body_typed(ModuleAttrs);
 
 }  // namespace ir
 }  // namespace ir_builder

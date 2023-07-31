@@ -265,9 +265,15 @@ void HexagonThreadManager::WaitOnThreads() {
 }
 
 void HexagonThreadManager::CheckSemaphore(unsigned syncID) {
+  // We want the success case to be fast, so do not lock the mutex
   if (semaphores_.find(syncID) == semaphores_.end()) {
-    semaphores_[syncID] = reinterpret_cast<qurt_sem_t*>(malloc(sizeof(qurt_sem_t)));
-    qurt_sem_init_val(semaphores_[syncID], 0);
+    // If we don't find it, lock the mutex, make sure it hasn't
+    // been added by another thread before creating it.
+    std::lock_guard<std::mutex> lock(semaphores_mutex_);
+    if (semaphores_.find(syncID) == semaphores_.end()) {
+      semaphores_[syncID] = reinterpret_cast<qurt_sem_t*>(malloc(sizeof(qurt_sem_t)));
+      qurt_sem_init_val(semaphores_[syncID], 0);
+    }
   }
 }
 
@@ -325,8 +331,9 @@ void HexagonThreadManager::thread_exit(void* context) {
     tc->hvx->Unlock();
     DLOG(INFO) << "Thread " << index << " unlocked an HVX instance";
   } else if (resource_type == HTP_0) {
-    tc->htp->Unlock();
-    DLOG(INFO) << "Thread " << index << " unlocked the HTP";
+    // TODO(HWE): Perform HTP lock/unlock in thread instead of HexagonHtp
+    // tc->htp->Unlock();
+    // DLOG(INFO) << "Thread " << index << " unlocked the HTP";
   }
 
   DLOG(INFO) << "Thread " << index << " exiting";
@@ -346,8 +353,9 @@ void HexagonThreadManager::thread_main(void* context) {
     tc->hvx->Lock();
     DLOG(INFO) << "Thread " << index << " locked an HVX instance";
   } else if (resource_type == HTP_0) {
-    tc->htp->Lock();
-    DLOG(INFO) << "Thread " << index << " locked the HTP";
+    // TODO(HWE): Perform HTP lock/unlock in thread instead of HexagonHtp
+    // tc->htp->Lock();
+    // DLOG(INFO) << "Thread " << index << " locked the HTP";
   }
 
   while (true) {  // loop, executing commands from pipe

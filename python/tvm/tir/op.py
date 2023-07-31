@@ -18,14 +18,15 @@
 """Operators used in TIR expression."""
 import warnings
 from typing import Any, Optional
-import tvm._ffi
-from tvm.ir.base import Span
-from tvm.runtime import convert, const
-from tvm.ir import Array, Op, PrimExpr
 
-from .buffer import Buffer
-from .expr import Call, PrimExprWithOp, StringImm, Var, CommReducer, IntImm
+import tvm._ffi
+from tvm.ir import Array, Op, PrimExpr
+from tvm.ir.base import Span
+from tvm.runtime import const, convert
+
 from . import _ffi_api
+from .buffer import Buffer
+from .expr import Call, CommReducer, IntImm, PrimExprWithOp, StringImm, Var
 
 
 def _pack_buffer(buf, span=None):
@@ -322,6 +323,24 @@ def call_llvm_pure_intrin(dtype, name, *args, span=None):
     )
 
 
+def tvm_check_return(expected, return_unexpected, nested_call):
+    """Return new on stack dtype[num]
+    Parameters
+    ----------
+    expected : int
+        The expected return code.
+    return_unexpected : int
+        The unexpected return code.
+    nested_call : PrimExpr
+        The call expression to check return.
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin("int32", "tir.tvm_check_return", expected, return_unexpected, nested_call)
+
+
 def tvm_stack_alloca(dtype_str, num):
     """Return new on stack dtype[num]
 
@@ -403,7 +422,7 @@ def assume(cond=None):
     call : PrimExpr
         The call expression.
     """
-    return call_intrin("int32", "tir.assume", cond)
+    return call_intrin("bool", "tir.assume", cond)
 
 
 def undef():
@@ -415,6 +434,53 @@ def undef():
         The call expression.
     """
     return call_intrin("int32", "tir.undef")
+
+
+def call_tir(global_var: tvm.ir.GlobalVar, *args):
+    """Performs a call into another PrimFunc in the same IRModule
+
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    assert isinstance(global_var, tvm.ir.GlobalVar)
+
+    dtype = "void"
+    if global_var.checked_type is not None:
+        ret_type = global_var.checked_type.ret_type
+        if hasattr(ret_type, "dtype"):
+            dtype = ret_type.dtype
+
+    return Call(dtype=dtype, op=global_var, args=args)
+
+
+def start_profile_intrinsic(id):
+    """Start profile intrinsic.
+    Parameters
+    ----------
+    id : int
+        The intrinsic id.
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin("handle", "tir.start_profile_intrinsic", id)
+
+
+def end_profile_intrinsic(id):
+    """End profile intrinsic.
+    Parameters
+    ----------
+    id : int
+        The intrinsic id.
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin("handle", "tir.end_profile_intrinsic", id)
 
 
 def tvm_tuple(*value):
@@ -480,7 +546,7 @@ def tvm_struct_set(arr, index, field, value):
     call : PrimExpr
         The call expression.
     """
-    return call_intrin("handle", "tir.tvm_struct_set", arr, index, field, value)
+    return call_intrin("int32", "tir.tvm_struct_set", arr, index, field, value)
 
 
 def address_of(buffer_load, span=None):
@@ -522,7 +588,8 @@ def lookup_param(param_name, span=None):
 
 
 def tvm_thread_allreduce(*freduce_args):
-    """
+    """Perform allreduce inside threadblock.
+
     Parameters
     ----------
     freduce_args : Expr
@@ -534,6 +601,111 @@ def tvm_thread_allreduce(*freduce_args):
         The call expression.
     """
     return call_intrin("handle", "tir.tvm_thread_allreduce", *freduce_args)
+
+
+def tvm_storage_sync(storage_scope):
+    """Perform synchronization in specified scope.
+
+    Parameters
+    ----------
+    storage_scope : str
+        The storage scope to perform synchronization.
+
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin("int32", "tir.tvm_storage_sync", storage_scope)
+
+
+def tvm_warp_shuffle(mask, value, warp_id, width, warp_size):
+    """Exchange value between threads inside a warp.
+
+    Parameters
+    ----------
+    mask : PrimExpr
+        The warp mask indicates active threads inside warp.
+    value : PrimExpr
+        The value to exchange.
+    warp_id : PrimExpr
+        The source lane index to fetch value.
+    width : PrimExpr
+        The width of sub-sections to perform warp shuffle.
+    warp_size : PrimExpr
+        The warp size.
+
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin(value.dtype, "tir.tvm_warp_shuffle", mask, value, warp_id, width, warp_size)
+
+
+def tvm_warp_shuffle_up(mask, value, offset, width, warp_size):
+    """Copy value from a lane with lower (by offset) index relative to caller.
+
+    Parameters
+    ----------
+    mask : PrimExpr
+        The warp mask indicates active threads inside warp.
+    value : PrimExpr
+        The value to exchange.
+    offset : PrimExpr
+        The difference between source lane index and destination lane index:
+        `offset = dst_lane_idx - src_lane_idx`
+    width : PrimExpr
+        The width of sub-sections to perform warp shuffle.
+    warp_size : PrimExpr
+        The warp size.
+
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin(
+        value.dtype, "tir.tvm_warp_shuffle_up", mask, value, offset, width, warp_size
+    )
+
+
+def tvm_warp_shuffle_down(mask, value, offset, width, warp_size):
+    """Copy value from a lane with higher (by offset) index relative to caller.
+
+    Parameters
+    ----------
+    mask : PrimExpr
+        The warp mask indicates active threads inside warp.
+    value : PrimExpr
+        The value to exchange.
+    offset : PrimExpr
+        The difference between source lane index and destination lane index:
+        `offset = src_lane_idx - dst_lane_idx`
+    width : PrimExpr
+        The width of sub-sections to perform warp shuffle.
+    warp_size : PrimExpr
+        The warp size.
+
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin(
+        value.dtype, "tir.tvm_warp_shuffle_down", mask, value, offset, width, warp_size
+    )
+
+
+def tvm_warp_activemask():
+    """Return a 32-bit mask indicates currently active threads in a calling warp.
+
+    Returns
+    -------
+    call : PrimExpr
+        The call expression.
+    """
+    return call_intrin("uint32", "tir.tvm_warp_activemask")
 
 
 def type_annotation(dtype):
@@ -1295,6 +1467,8 @@ def ret(val):
     ret : PrimExpr
         The return expression
     """
+
+    val = convert(val)
     return call_intrin(val.dtype, "tir.ret", val)
 
 
@@ -1480,6 +1654,7 @@ def exp(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.exp", x)
 
 
@@ -1496,6 +1671,7 @@ def exp2(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.exp2", x)
 
 
@@ -1512,6 +1688,7 @@ def exp10(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.exp10", x)
 
 
@@ -1528,6 +1705,7 @@ def erf(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.erf", x)
 
 
@@ -1544,6 +1722,7 @@ def tanh(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.tanh", x)
 
 
@@ -1560,6 +1739,7 @@ def sigmoid(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.sigmoid", x)
 
 
@@ -1576,6 +1756,7 @@ def log(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.log", x)
 
 
@@ -1592,6 +1773,7 @@ def log2(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.log2", x)
 
 
@@ -1608,6 +1790,7 @@ def log10(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.log10", x)
 
 
@@ -1624,6 +1807,7 @@ def log1p(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.log1p", x)
 
 
@@ -1640,6 +1824,7 @@ def tan(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.tan", x)
 
 
@@ -1656,6 +1841,7 @@ def cos(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.cos", x)
 
 
@@ -1672,6 +1858,7 @@ def cosh(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.cosh", x)
 
 
@@ -1688,6 +1875,7 @@ def acos(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.acos", x)
 
 
@@ -1704,6 +1892,7 @@ def acosh(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.acosh", x)
 
 
@@ -1720,6 +1909,7 @@ def sin(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.sin", x)
 
 
@@ -1736,6 +1926,7 @@ def sinh(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.sinh", x)
 
 
@@ -1752,6 +1943,7 @@ def asin(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.asin", x)
 
 
@@ -1768,6 +1960,7 @@ def asinh(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.asinh", x)
 
 
@@ -1784,6 +1977,7 @@ def atan(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.atan", x)
 
 
@@ -1800,6 +1994,7 @@ def atanh(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.atanh", x)
 
 
@@ -1819,6 +2014,8 @@ def atan2(x1, x2):
     y : PrimExpr
         The result.
     """
+    x1 = convert(x1)
+    x2 = convert(x2)
     return call_intrin(x1.dtype, "tir.atan2", x1, x2)
 
 
@@ -1835,6 +2032,7 @@ def sqrt(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.sqrt", x)
 
 
@@ -1851,6 +2049,7 @@ def rsqrt(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.rsqrt", x)
 
 
@@ -1950,6 +2149,91 @@ def abs(x, span=None):
     return _ffi_api.abs(x, span)  # type: ignore
 
 
+def bitwise_and(x, y, span=None):
+    """Take bitwise and of two values
+
+    Parameters
+    ----------
+    x : PrimExpr
+        Left operand
+
+    y : PrimExpr
+        Right operand
+
+    span : Optional[Span]
+        The location of this operator in the source code.
+
+    Returns
+    -------
+    res : PrimExpr
+        The result.
+    """
+    return _ffi_api.bitwise_and(x, y, span)
+
+
+def bitwise_not(x, span=None):
+    """Take bitwise not of input value
+
+    Parameters
+    ----------
+    x : PrimExpr
+        Input operand
+
+    span : Optional[Span]
+        The location of this operator in the source code.
+
+    Returns
+    -------
+    res : PrimExpr
+        The result.
+    """
+    return _ffi_api.bitwise_not(x, span)
+
+
+def bitwise_or(x, y, span=None):
+    """Take bitwise or of two values
+
+    Parameters
+    ----------
+    x : PrimExpr
+        Left operand
+
+    y : PrimExpr
+        Right operand
+
+    span : Optional[Span]
+        The location of this operator in the source code.
+
+    Returns
+    -------
+    res : PrimExpr
+        The result.
+    """
+    return _ffi_api.bitwise_or(x, y, span)
+
+
+def bitwise_xor(x, y, span=None):
+    """Take bitwise xor of two values
+
+    Parameters
+    ----------
+    x : PrimExpr
+        Left operand
+
+    y : PrimExpr
+        Right operand
+
+    span : Optional[Span]
+        The location of this operator in the source code.
+
+    Returns
+    -------
+    res : PrimExpr
+        The result.
+    """
+    return _ffi_api.bitwise_xor(x, y, span)
+
+
 def round(x, span=None):
     """Round elements of the array to the nearest integer.
 
@@ -2011,6 +2295,8 @@ def nextafter(x1, x2):
     y : PrimExpr
         The result.
     """
+    x1 = convert(x1)
+    x2 = convert(x2)
     return call_intrin(x1.dtype, "tir.nextafter", x1, x2)  # type: ignore
 
 
@@ -2030,6 +2316,8 @@ def hypot(x1, x2):
     y : PrimExpr
         The result.
     """
+    x1 = convert(x1)
+    x2 = convert(x2)
     return call_intrin(x1.dtype, "tir.hypot", x1, x2)  # type: ignore
 
 
@@ -2049,6 +2337,8 @@ def copysign(x1, x2):
     y : PrimExpr
         The result.
     """
+    x1 = convert(x1)
+    x2 = convert(x2)
     return call_intrin(x1.dtype, "tir.copysign", x1, x2)  # type: ignore
 
 
@@ -2068,6 +2358,8 @@ def ldexp(x1, x2):
     y : PrimExpr
         The result.
     """
+    x1 = convert(x1)
+    x2 = convert(x2)
     return call_intrin(x1.dtype, "tir.ldexp", x1, x2)  # type: ignore
 
 
@@ -2189,6 +2481,28 @@ def power(x, y, span=None):
     return _ffi_api._OpPow(convert(x), convert(y), span)  # type: ignore
 
 
+def pow(x, y, span=None):
+    """x power y
+
+    Parameters
+    ----------
+    x : PrimExpr
+        Input argument.
+
+    y : PrimExpr
+        The exponent
+
+    span : Optional[Span]
+        The location of this operator in the source code.
+
+    Returns
+    -------
+    z : PrimExpr
+        The result.
+    """
+    return _ffi_api._OpPow(convert(x), convert(y), span)  # type: ignore
+
+
 def popcount(x):
     """Count the number of set bits in input x.
 
@@ -2202,6 +2516,7 @@ def popcount(x):
     y : PrimExpr
         The result.
     """
+    x = convert(x)
     return call_intrin(x.dtype, "tir.popcount", x)
 
 
@@ -2333,6 +2648,8 @@ def fmod(x, y):
     z : PrimExpr
         The result.
     """
+    x = convert(x)
+    y = convert(y)
     return call_intrin(x.dtype, "tir.fmod", x, y)
 
 

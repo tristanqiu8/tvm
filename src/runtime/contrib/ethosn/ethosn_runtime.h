@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "ethosn_driver_library/Network.hpp"
+#include "ethosn_driver_library/ProcMemAllocator.hpp"
 #include "ethosn_support_library/Support.hpp"
 
 namespace tvm {
@@ -46,6 +47,7 @@ namespace dl = ::ethosn::driver_library;
 struct OrderedCompiledNetwork {
   std::unique_ptr<sl::CompiledNetwork> compiled_cmm;
   std::unique_ptr<dl::Network> runtime_cmm;
+  std::unique_ptr<dl::ProcMemAllocator> proc_mem_alloc;
   std::string name;
   std::vector<uint32_t> inputs;
   std::vector<uint32_t> outputs;
@@ -67,7 +69,7 @@ class EthosnModule : public ModuleNode {
    * \param sptr_to_self The ObjectPtr that points to this module node.
    * \return The function pointer when it is found, otherwise, PackedFunc(nullptr).
    */
-  PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) final;
+  PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) final;
   /*!
    * \brief Save a compiled network to a binary stream, which can then be
    * serialized to disk.
@@ -98,9 +100,14 @@ class EthosnModule : public ModuleNode {
    * \brief Save a module to a specified path.
    * \param path Where to save the serialized module.
    */
-  void SaveToFile(const std::string& path, const std::string& format) override;
+  void SaveToFile(const String& path, const String& format) override;
 
   const char* type_key() const override { return "ethos-n"; }
+
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final {
+    return ModulePropertyMask::kBinarySerializable | ModulePropertyMask::kRunnable;
+  };
 
  private:
   /*! \brief A map between ext_symbols (function names) and ordered compiled networks. */

@@ -174,13 +174,31 @@ class Target(Object):
         return int(self.attrs["max_num_threads"])
 
     @property
+    def max_block_size_x(self):
+        """Returns the max block size in x-dimension from the target if it exists."""
+        return int(self.attrs["max_block_size_x"])
+
+    @property
+    def max_block_size_y(self):
+        """Returns the max block size in y-dimension from the target if it exists."""
+        return int(self.attrs["max_block_size_y"])
+
+    @property
     def thread_warp_size(self):
         """Returns the thread_warp_size from the target if it exists."""
         return int(self.attrs["thread_warp_size"])
 
     @property
+    def max_shared_memory_per_block(self):
+        return int(self.attrs["max_shared_memory_per_block"])
+
+    @property
     def max_function_args(self):
-        return int(self.attrs.get("max_function_args", -1))
+        return int(self.attrs.get("max_function_args", 0))
+
+    @property
+    def vtcm_capacity(self):
+        return int(self.attrs.get("vtcm-capacity", 0))
 
     @property
     def device_name(self):
@@ -216,8 +234,19 @@ class Target(Object):
         return list(self.attrs.get("libs", []))
 
     @property
+    def supports_cooperative_matrix(self):
+        if self.attrs.get("supports_cooperative_matrix", []):
+            return bool(self.attrs["supports_cooperative_matrix"])
+        else:
+            return False
+
+    @property
     def features(self):
         return TargetFeatures(self)
+
+    @property
+    def l2_cache_size_bytes(self):
+        return int(self.attrs.get("l2_cache_size_bytes", 0))
 
     def get_kind_attr(self, attr_name):
         """Get additional attribute about the target kind.
@@ -628,12 +657,12 @@ def riscv_cpu(model="ri5cy", options=None):
     return Target(" ".join(["llvm"] + opts))
 
 
-def hexagon(cpu_ver="v66", **kwargs):
+def hexagon(cpu_ver="v68", **kwargs):
     """Returns a Hexagon target.
 
     Parameters
     ----------
-    cpu_ver : str (default: "v66")
+    cpu_ver : str (default: "v68")
         CPU version used for code generation. Not all allowed cpu str
         will be valid, LLVM will throw an error.
 
@@ -649,6 +678,8 @@ def hexagon(cpu_ver="v66", **kwargs):
         Whether to use IEEE HVX instructions
     num_cores : int (default: 4)
         The number of HVX threads. This attribute is required by meta scheduler.
+    vtcm_capacity: int (default: 0)
+        Hexagon VTCM capacity limitation. If the value is 0, the capacity is treated as unbounded.
 
     Note: Floating point support in HVX requires LLVM 14+.
     """
@@ -659,7 +690,7 @@ def hexagon(cpu_ver="v66", **kwargs):
     # in place of '-'.
 
     # Example compiler arguments
-    # llvm -mtriple=hexagon -mcpu=hexagonv66 -mattr=+hvxv66,+hvx-length128b
+    # llvm -mtriple=hexagon -mcpu=hexagonv68 -mattr=+hvxv68,+hvx-length128b
 
     def get_arch_version(cpu_ver):
         m = re.match(r"v([0-9]+).*", cpu_ver)
@@ -667,13 +698,24 @@ def hexagon(cpu_ver="v66", **kwargs):
         return int(m.group(1))
 
     # Check for valid codegen cpu
-    valid_hex = ["v65", "v66", "v67", "v67t", "v68", "v69"]
+    valid_hex = ["v65", "v66", "v67", "v67t", "v68", "v69", "v71", "v73"]
     try:
         cpu_ver = cpu_ver[cpu_ver.index("v") :].lower()
         assert cpu_ver in valid_hex
     except:
         msg = "{} is not a valid Hexagon version\nvalid versions include {}"
         raise ValueError(msg.format(cpu_ver, valid_hex)) from None
+
+    def get_vtcm_capacity(cpu_ver):
+        one_mb = 2**20
+        default_vtcm_sizes = {
+            "v65": one_mb // 4,
+            "v66": one_mb // 4,
+            "v68": 4 * one_mb,
+            "v69": 8 * one_mb,
+            "v73": 8 * one_mb,
+        }
+        return default_vtcm_sizes.get(cpu_ver, 0)
 
     # Target configuration:
     arch_version = get_arch_version(cpu_ver)
@@ -682,6 +724,7 @@ def hexagon(cpu_ver="v66", **kwargs):
         "llvm_options": None,
         "use_qfloat": arch_version >= 68,
         "use_ieee_fp": False,
+        "vtcm_capacity": get_vtcm_capacity(cpu_ver),
     }
     config.update(kwargs)
 
@@ -755,6 +798,7 @@ def hexagon(cpu_ver="v66", **kwargs):
 
     num_cores = config["num_cores"] if "num_cores" in kwargs else 4
     args_list.append("--num-cores=%d" % num_cores)
+    args_list.append("--vtcm-capacity=%d" % config["vtcm_capacity"])
 
     return Target(" ".join(["hexagon"] + args_list))
 

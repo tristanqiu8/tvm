@@ -25,7 +25,10 @@ from tvm.ir import TensorAffineType, TupleAffineType
 from tvm.relay.qnn.op import canonicalizations
 from tvm.tir import bijective_layout
 
-from ..op import register_fake_quantization_to_integer
+from ..op import (
+    register_fake_quantization_to_integer,
+    register_optional_fake_quantization_to_integer,
+)
 
 
 def fold_constant(expr):
@@ -108,6 +111,32 @@ register_unary_identity("min")
 register_unary_identity("image.resize2d")
 
 
+@register_fake_quantization_to_integer("nn.avg_pool2d")
+def avgpool2d(expr, type_map):
+    """Rewrite an avgpool op"""
+    attrs = {**expr.attrs}
+    arg = expr.args[0]
+    t = type_map[arg]
+    out_t = type_map[expr]
+
+    out = relay.qnn.op.avg_pool2d(
+        arg,
+        t.scale,
+        t.zero_point,
+        out_t.scale,
+        out_t.zero_point,
+        attrs["pool_size"],
+        attrs["strides"],
+        attrs["padding"],
+        attrs["dilation"],
+        attrs["ceil_mode"],
+        attrs["count_include_pad"],
+        attrs["layout"],
+    )
+
+    return [out, TensorAffineType(out_t.scale, out_t.zero_point, out_t.dtype, out_t.axis)]
+
+
 @register_fake_quantization_to_integer("nn.adaptive_avg_pool1d")
 def adaptive_avgpool1d(expr, type_map):
     """Rewrite an adaptive avgpool op"""
@@ -132,32 +161,6 @@ def adaptive_avgpool1d(expr, type_map):
         arg = relay.op.cast(arg, "int32")
     output_size = expr.attrs.output_size
     out = relay.op.nn.adaptive_avg_pool1d(arg, output_size)
-    return [out, TensorAffineType(out_t.scale, out_t.zero_point, "int32", out_t.axis)]
-
-
-@register_fake_quantization_to_integer("nn.avg_pool2d")
-def avgpool2d(expr, type_map):
-    """Rewrite a avgpool op"""
-    arg = expr.args[0]
-    t = type_map[arg]
-    out_t = type_map[expr]
-    if not (
-        approx_equal(t.scale, out_t.scale)
-        and approx_equal(t.zero_point, out_t.zero_point)
-        and tvm.ir.structural_equal(t.dtype, out_t.dtype)
-    ):
-        arg = relay.qnn.op.requantize(
-            arg,
-            t.scale,
-            t.zero_point,
-            out_t.scale,
-            out_t.zero_point,
-            out_dtype="int32",
-            axis=t.axis,
-        )
-    else:
-        arg = relay.op.cast(arg, "int32")
-    out = relay.op.nn.avg_pool2d(arg, **expr.attrs)
     return [out, TensorAffineType(out_t.scale, out_t.zero_point, "int32", out_t.axis)]
 
 
@@ -214,13 +217,7 @@ def bias_add(expr, type_map):
             and tvm.ir.structural_equal(x_t.dtype, b_t.dtype)
         ):
             b = relay.qnn.op.requantize(
-                b,
-                b_t.scale,
-                b_t.zero_point,
-                in_scale,
-                in_zero_point,
-                out_dtype=x_t.dtype,
-                axis=0,
+                b, b_t.scale, b_t.zero_point, in_scale, in_zero_point, out_dtype=x_t.dtype, axis=0
             )
     else:
         # If the bias is a constant, we need to quantize it
@@ -497,6 +494,35 @@ def register_binary_qnn(op_name, op):
 
     def binary(expr, type_map):
         left, right, left_t, right_t, out_t = get_binary_types(expr, type_map)
+
+        if (
+            op_name == "add"
+            and approx_equal(left_t.scale, right_t.scale)
+            and approx_equal(left_t.zero_point, right_t.zero_point)
+            and tvm.ir.structural_equal(left_t.dtype, right_t.dtype)
+            and left_t.dtype == "int32"
+            and approx_equal(left_t.scale, out_t.scale)
+            and approx_equal(left_t.zero_point, out_t.zero_point)
+            and np.all(out_t.zero_point.data.numpy() == 0)
+        ):
+            # If this add op comes after conv2d or dense, out_t.scale and out_t.zero_point
+            # can be a vector, which is not supported by QNN binary operators.
+            # In particular, the pattern of an `add` op following `dense`, where the addition is
+            # really a bias addtion, can come up often. We identify that pattern and convert it to
+            # `qnn.dense` -> `add`.
+            # To avoid overflow, we do this conversion only when the input data type is 32 bit (bias
+            # addition is typically done in 32 bit).
+            return [left + right, left_t]
+
+        assert len(out_t.scale.data.shape) == 0, (
+            f"The output scale needs to be a scalar, but got a tensor of shape "
+            f"{out_t.scale.data.shape}"
+        )
+        assert len(out_t.zero_point.data.shape) == 0, (
+            f"The output zero point needs to be a scalar, but got a tensor of shape "
+            f"{out_t.zero_point.data.shape}"
+        )
+
         out = op(
             left,
             right,
@@ -565,13 +591,7 @@ def register_unary_qnn(op_name, op):
         arg = expr.args[0]
         x_t = type_map[arg]
         out_t = type_map[expr]
-        out = op(
-            arg,
-            x_t.scale,
-            x_t.zero_point,
-            out_t.scale,
-            out_t.zero_point,
-        )
+        out = op(arg, x_t.scale, x_t.zero_point, out_t.scale, out_t.zero_point)
         return [out, out_t]
 
     return register_fake_quantization_to_integer(op_name, unary)
@@ -586,3 +606,27 @@ register_unary_qnn("hardswish", relay.qnn.op.hardswish)
 register_unary_qnn("tanh", relay.qnn.op.tanh)
 register_unary_qnn("abs", relay.qnn.op.abs)
 register_unary_qnn("log", relay.qnn.op.log)
+
+
+@register_fake_quantization_to_integer("take")
+def take(expr, type_map):
+    """Rewrite a take op"""
+    arg = expr.args[0]
+    indices = expr.args[1]
+    t = type_map[arg]
+
+    out = relay.op.take(arg, indices, **expr.attrs)
+    return [out, t]
+
+
+@register_optional_fake_quantization_to_integer("nn.softmax")
+def softmax(expr, type_map):
+    """Rewrite a softmax op"""
+    arg = expr.args[0]
+    arg_t = type_map[arg]
+    out_t = type_map[expr]
+
+    out = relay.qnn.op.softmax(
+        arg, arg_t.scale, arg_t.zero_point, out_t.scale, out_t.zero_point, **expr.attrs
+    )
+    return [out, out_t]

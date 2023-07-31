@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=unused-variable
 """
 This script is for benchmarking TVM performance on models from TorchBench.
 It uses the TorchDynamo as the frontend to ingest models into TVM, and it also
@@ -94,11 +95,12 @@ import argparse
 import contextlib
 import logging
 import os
+import pickle
 import sys
 import warnings
 from collections import defaultdict
 from enum import Enum
-from typing import Callable, List, Tuple, Dict
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np  # type: ignore
 import torch  # type: ignore
@@ -110,6 +112,7 @@ from tvm import meta_schedule as ms
 from tvm._ffi import get_global_func
 from tvm.contrib.graph_executor import GraphModule
 from tvm.meta_schedule.testing.torchbench.utils import (
+    DisallowedOperator,
     load_torchdynamo_benchmark_runner,
     same,
     timed,
@@ -124,28 +127,37 @@ import torchdynamo  # type: ignore  # isort: skip, pylint: disable=wrong-import-
 class RunMode(Enum):
     """
     The running mode of this script. Available values are:
-    - tune: Only tune the model and create the tuning database.
+    - extract: Only import the model and extract tuning tasks from it.
+    - tune: Only tune the tasks and create the tuning database.
     - eval: Only benchmark model using pre-existing tuning database.
     - all: Run both tuning and benchmark
     """
 
     ALL = "all"
+    EXTRACT = "extract"
     TUNE = "tune"
     EVAL = "eval"
 
     @property
+    def should_extract(self):
+        """
+        Returns whether it should extract tuning tasks.
+        """
+        return self in (RunMode.ALL, RunMode.EXTRACT)
+
+    @property
     def should_tune(self):
         """
-        Returns whether it should tune the model.
+        Returns whether it should tune the tasks.
         """
-        return self != RunMode.EVAL
+        return self in (RunMode.ALL, RunMode.TUNE)
 
     @property
     def should_eval(self):
         """
         Returns whether it should actually benchmark the model.
         """
-        return self != RunMode.TUNE
+        return self in (RunMode.ALL, RunMode.EVAL)
 
 
 class ResultComparisonMetric(Enum):
@@ -195,6 +207,12 @@ def parse_args():
         type=int,
         default=5,
         help="The number of rounds to warmup before starting to measure the performance.",
+    )
+    args.add_argument(
+        "--disallowed-op",
+        type=str,
+        default="all",
+        help=DisallowedOperator.__doc__,
     )
 
     # Model selection
@@ -313,6 +331,12 @@ def parse_args():
 
     parsed = args.parse_args()
 
+    if parsed.disallowed_op == "all":
+        disallowed_op = set(DisallowedOperator)
+    else:
+        disallowed_op = {DisallowedOperator(v) for v in parsed.disallowed_op.split(",")}
+    parsed.disallowed_op = disallowed_op
+
     # Trim all args, otherwise it confuses the arg parser of timm_efficientdet
     sys.argv = sys.argv[:1]
 
@@ -335,6 +359,7 @@ runner = load_torchdynamo_benchmark_runner(  # pylint: disable=invalid-name
     IS_CUDA,
     cosine_similarity=ARGS.result_metric == ResultComparisonMetric.COSINE,
     float32=ARGS.float32,
+    disallowed_operators=ARGS.disallowed_op,
 )
 
 
@@ -431,6 +456,20 @@ def get_vm_forward(virtual_machine: VirtualMachine, device: tvm.runtime.Device) 
     return forward
 
 
+def should_skip_subgraph(graph_module: torch.fx.GraphModule) -> bool:
+    """
+    Returns whether it should skip optimizing the input graph module.
+    The graph could be empyt or only containing nodes calling function
+    for side effect.
+    """
+    graph = graph_module.graph
+
+    inputs = [n for n in graph.nodes if n.op == "placeholder"]
+    outputs = [n for n in graph.nodes if n.op == "output"]
+
+    return len(inputs) == 0 and all(output.args == ((),) for output in outputs)
+
+
 def create_tvm_task_collection_backend() -> Tuple[Callable, List[ms.ExtractedTask]]:
     """
     This torchdynamo backend only collects the extracted tasks from MetaSchedule.
@@ -460,6 +499,9 @@ def create_tvm_task_collection_backend() -> Tuple[Callable, List[ms.ExtractedTas
 
         torch.save(graph_module, os.path.join(subgraphs_dir, f"graph_module_{subgraph_idx}"))
         torch.save(example_inputs, os.path.join(subgraphs_dir, f"example_inputs_{subgraph_idx}"))
+
+        if should_skip_subgraph(graph_module):
+            return graph_module.forward
 
         jit_mod = torch.jit.trace(graph_module, example_inputs)
         shape_list = [(f"inp_{idx}", i.shape) for idx, i in enumerate(example_inputs)]
@@ -494,6 +536,9 @@ def create_tvm_compilation_backend(database: ms.database.Database) -> Callable:
     """
 
     def backend(graph_module, example_inputs):
+        if should_skip_subgraph(graph_module):
+            return graph_module.forward
+
         jit_mod = torch.jit.trace(graph_module, example_inputs)
         shape_list = [(f"inp_{idx}", i.shape) for idx, i in enumerate(example_inputs)]
         ir_mod, params = tvm.relay.frontend.from_pytorch(jit_mod, shape_list)
@@ -700,11 +745,19 @@ def main():
         profiler = stack.enter_context(ms.Profiler())
         stack.enter_context(torch.no_grad())
 
-        if ARGS.mode.should_tune:
+        tasks_path = os.path.join(ARGS.work_dir, "extracted_tasks")
+
+        if ARGS.mode.should_extract:
             task_collect_backend, extracted_tasks = create_tvm_task_collection_backend()
             task_collect_ctx = torchdynamo.optimize(task_collect_backend)
             task_collect_ctx(runner.model_iter_fn)(model, example_inputs)
+            with open(tasks_path, "wb") as f:
+                pickle.dump(extracted_tasks, f)
+        else:
+            with open(tasks_path, "rb") as f:
+                extracted_tasks = pickle.load(f)
 
+        if ARGS.mode.should_tune:
             tasks, task_weights = ms.relay_integration.extracted_tasks_to_tune_contexts(
                 extracted_tasks=extracted_tasks,
                 work_dir=ARGS.work_dir,

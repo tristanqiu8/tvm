@@ -19,7 +19,7 @@
 import pytest
 import inspect
 import tvm.testing
-from tvm.script._parser import ir_module
+from tvm.script.parser import ir_module
 from tvm.ir import IRModule
 
 
@@ -29,6 +29,7 @@ def test_ir_base():
         pass
 
     assert isinstance(BlankIRModule, IRModule) and len(BlankIRModule.functions.items()) == 0
+    assert BlankIRModule.__name__ == "BlankIRModule"
 
 
 if __name__ == "__main__":

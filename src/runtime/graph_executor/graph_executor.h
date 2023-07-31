@@ -66,7 +66,7 @@ struct TVMOpParam {
  */
 class TVM_DLL GraphExecutor : public ModuleNode {
   struct OpArgs {
-    std::vector<DLTensor> args;
+    std::vector<DLTensor*> args;
     std::vector<TVMValue> arg_values;
     std::vector<int> arg_tcodes;
     std::vector<int64_t> shape_data;
@@ -81,13 +81,16 @@ class TVM_DLL GraphExecutor : public ModuleNode {
    * \param sptr_to_self The pointer to the module node.
    * \return The corresponding member function.
    */
-  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self);
 
   /*!
    * \return The type key of the executor.
    */
   const char* type_key() const final { return "GraphExecutor"; }
   void Run();
+
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final { return ModulePropertyMask::kRunnable; }
 
   /*!
    * \brief Initialize the graph executor with graph and device.
@@ -116,6 +119,12 @@ class TVM_DLL GraphExecutor : public ModuleNode {
    * \return The shape and dtype tuple.
    */
   std::tuple<ShapeInfo, DtypeInfo> GetInputInfo() const;
+
+  /*!
+   * \brief Get the output info of Graph by parsing the output nodes.
+   * \return The shape and dtype tuple.
+   */
+  std::tuple<ShapeInfo, DtypeInfo> GetOutputInfo() const;
 
   /*!
    * \brief Get the output index given the name of output.
@@ -428,7 +437,7 @@ class TVM_DLL GraphExecutor : public ModuleNode {
    * \return The created executor.
    */
   std::pair<std::function<void()>, std::shared_ptr<OpArgs>> CreateTVMOp(
-      const TVMOpParam& attrs, const std::vector<DLTensor>& args);
+      const TVMOpParam& attrs, const std::vector<DLTensor*>& args);
   // Get node entry index.
   uint32_t entry_id(uint32_t nid, uint32_t index) const { return node_row_ptr_[nid] + index; }
   // Get node entry index.
@@ -451,6 +460,8 @@ class TVM_DLL GraphExecutor : public ModuleNode {
   std::vector<std::vector<DLTensor*>> output_dltensors_;
   /*! \brief Used for quick node(both model output and op input) DLTensor* lookup given an eid. */
   std::vector<std::vector<DLTensor*>> both_output_opinput_dltensors_;
+  /*! \brief Used for quick entry_id lookup given an storage_id. */
+  std::vector<std::vector<uint32_t>> sid_to_eid_;
   /*! \brief Used for quick entry indexing. */
   std::vector<uint32_t> node_row_ptr_;
   /*! \brief Output entries. */

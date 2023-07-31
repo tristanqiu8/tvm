@@ -103,8 +103,8 @@ Definition of a scope that is a stage pipeline:
     }
   }
   // Step 2. Handle `require_stage_pipeline`
-  if (require_stage_pipeline) {
-    bool stage_pipeline = self->GetBlockInfo(scope_root_sref).scope->stage_pipeline;
+  if (require_stage_pipeline && self->enable_check) {
+    bool stage_pipeline = self->GetBlockInfo(scope_root_sref).stage_pipeline;
     if (stage_pipeline == false) {
       const BlockNode* block = TVM_SREF_TO_BLOCK(scope_root_sref);
       throw NotStagePipelineError(self->mod, GetRef<Block>(block));
@@ -1014,23 +1014,60 @@ std::pair<Array<StmtSRef>, std::vector<int>> CollectComputeLocation(const Schedu
 /******** Producer-consumer relation ********/
 
 Array<StmtSRef> GetProducers(const StmtSRef& block_sref, const BlockScope& scope) {
-  Array<Dependency> deps = scope->GetDepsByDst(block_sref);
-  Array<StmtSRef> result;
-  result.reserve(deps.size());
-  for (const Dependency& dep : deps) {
-    result.push_back(dep->src);
+  Array<Dependency> edges = scope->GetDepsByDst(block_sref);
+  Array<StmtSRef> results;
+  std::unordered_set<StmtSRef, ObjectPtrHash, ObjectPtrEqual> result_set;
+  results.reserve(edges.size());
+  for (const Dependency& edge : edges) {
+    if ((edge->kind == DepKind::kRAW || edge->kind == DepKind::kWAW) &&
+        !result_set.count(edge->src)) {
+      results.push_back(edge->src);
+      result_set.emplace(edge->src);
+    }
   }
-  return result;
+  return results;
 }
 
 Array<StmtSRef> GetConsumers(const StmtSRef& block_sref, const BlockScope& scope) {
-  Array<Dependency> deps = scope->GetDepsBySrc(block_sref);
-  Array<StmtSRef> result;
-  result.reserve(deps.size());
-  for (const Dependency& dep : deps) {
-    result.push_back(dep->dst);
+  Array<Dependency> edges = scope->GetDepsBySrc(block_sref);
+  Array<StmtSRef> results;
+  std::unordered_set<StmtSRef, ObjectPtrHash, ObjectPtrEqual> result_set;
+  results.reserve(edges.size());
+  for (const Dependency& edge : edges) {
+    if ((edge->kind == DepKind::kRAW || edge->kind == DepKind::kWAW) &&
+        !result_set.count(edge->dst)) {
+      results.push_back(edge->dst);
+      result_set.emplace(edge->dst);
+    }
   }
-  return result;
+  return results;
+}
+
+Array<StmtSRef> GetOutputBlocks(const ScheduleState& self, const BlockNode* scope_block) {
+  struct OutputBlockCollector : public StmtVisitor {
+    explicit OutputBlockCollector(const ScheduleState& self) : self_(self) {}
+
+    void VisitStmt_(const BlockNode* block) override {
+      auto it = self_->stmt2ref.find(block);
+      ICHECK(it != self_->stmt2ref.end());
+      auto block_sref = it->second;
+      if (block_sref->parent != nullptr) {
+        StmtSRef scope_root_sref =
+            GetScopeRoot(self_, block_sref, /*require_stage_pipeline=*/false);
+        if (IsOutputBlock(self_, block_sref, scope_root_sref)) {
+          results_.push_back(block_sref);
+        }
+      }
+      StmtVisitor::VisitStmt_(block);
+    }
+
+    const ScheduleState& self_;
+    Array<StmtSRef> results_;
+  };
+  OutputBlockCollector collector(self);
+  collector(scope_block->body);
+  auto results = collector.results_;
+  return results;
 }
 
 ProducerConsumerSplit ProducerConsumerSplit::Find(
@@ -1230,6 +1267,20 @@ StmtSRef GetSRefTreeRoot(const StmtSRef& sref) {
   for (; p->parent != nullptr; p = p->parent) {
   }
   return GetRef<StmtSRef>(p);
+}
+
+void AddShapeVarBounds(const ScheduleState& state, const StmtSRefNode* sref,
+                       arith::Analyzer* analyzer) {
+  while (sref->parent != nullptr) {
+    sref = sref->parent;
+  }
+  const PrimFuncNode* f = GetRootPrimFunc(state->mod, sref->stmt, nullptr);
+  for (const auto& kv : f->buffer_map) {
+    const Buffer& buffer = kv.second;
+    for (const PrimExpr& e : buffer->shape) {
+      analyzer->MarkGlobalNonNegValue(e);
+    }
+  }
 }
 
 /******** Misc ********/
@@ -1792,7 +1843,7 @@ Optional<TensorizeInfo> GetTensorizeLoopMapping(const tir::ScheduleState& self,
         if (allow_padding) {
           // If the block loop is not divisible by the desc loop, we pad the block loop to make it
           // divisible if padding is allowed.
-          block_index_to_padding[current_block_ind] = int_desc_extent->value - remainder;
+          block_index_to_padding[current_block_ind] = int_desc_extent->value;
         } else {
           return NullOpt;
         }
@@ -1816,7 +1867,7 @@ Optional<TensorizeInfo> GetTensorizeLoopMapping(const tir::ScheduleState& self,
       if (auto it = block_index_to_padding.find(i); it != block_index_to_padding.end()) {
         paddings.push_back(IntImm(iter_var->var.dtype(), it->second));
       } else {
-        paddings.push_back(IntImm(iter_var->var.dtype(), 0));
+        paddings.push_back(IntImm(iter_var->var.dtype(), 1));
       }
     }
     ret->block_iter_paddings = std::move(paddings);
@@ -2061,6 +2112,11 @@ TVM_REGISTER_GLOBAL("tir.schedule.GetAutoTensorizeMappingInfo")
     });
 
 TVM_REGISTER_GLOBAL("tir.schedule.HasBlock").set_body_typed(HasBlock);
+TVM_REGISTER_GLOBAL("tir.schedule.IsOutputBlock").set_body_typed([](Schedule sch, BlockRV block) {
+  auto state = sch->state();
+  auto block_sref = sch->GetSRef(block);
+  return IsOutputBlock(state, block_sref, GetScopeRoot(state, block_sref, false));
+});
 
 }  // namespace tir
 }  // namespace tvm

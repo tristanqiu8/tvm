@@ -32,6 +32,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "../../transforms/ir_utils.h"
+
 namespace tvm {
 
 /*!
@@ -54,8 +56,47 @@ namespace ethosu {
 
 namespace {
 
+struct FlattenUnwrapResult {
+  std::vector<Stmt> seq;
+  std::vector<Stmt> rewrap_nest;
+};
+
+/*! \brief Utility function to flatten SeqStmt
+ *
+ * An AttrStmt or DeclBuffer may internally contain SeqStmt nodes that
+ * we want to flatten.  Unlike SeqStmt::Flatten, this function unwraps
+ * these node types when encountered.
+ *
+ * \param stmt The tir::Stmt to be flattened.
+ * \return The flattened statements
+ */
+FlattenUnwrapResult FlattenUnwrap(const Stmt& stmt) {
+  std::vector<Stmt> seq_stmt;
+  std::vector<Stmt> rewrap_nest;
+  std::function<void(const Stmt&)> flatten_unwrap = [&](const Stmt& stmt) {
+    if (auto* ptr = stmt.as<DeclBufferNode>()) {
+      rewrap_nest.push_back(DeclBuffer(ptr->buffer, Evaluate(0)));
+      flatten_unwrap(ptr->body);
+    } else if (auto* ptr = stmt.as<SeqStmtNode>()) {
+      for (const auto& sub_stmt : ptr->seq) {
+        flatten_unwrap(sub_stmt);
+      }
+    } else if (auto* ptr = stmt.as<EvaluateNode>(); ptr && ptr->value.as<IntImmNode>()) {
+      // Skip
+    } else {
+      seq_stmt.push_back(stmt);
+    }
+  };
+  flatten_unwrap(stmt);
+  return FlattenUnwrapResult{seq_stmt, rewrap_nest};
+}
+
 /*! Returns the arguments of the given statement */
-Array<PrimExpr> GetStmtArgs(const Stmt& stmt) {
+Array<PrimExpr> GetStmtArgs(Stmt stmt) {
+  while (auto* ptr = stmt.as<DeclBufferNode>()) {
+    stmt = ptr->body;
+  }
+
   auto attr{stmt.as<AttrStmtNode>()};
   Stmt eval_stmt{attr ? attr->body : stmt};
   auto eval{eval_stmt.as<EvaluateNode>()};
@@ -144,7 +185,7 @@ class HoistAllocatesMutator : public StmtExprMutator {
     for (auto it = allocates_.rbegin(); it != allocates_.rend(); it++) {
       Allocate current_alloc = *it;
       if (it != allocates_.rbegin()) {
-        new_main_func_body = SeqStmt({new_main_func_body});
+        new_main_func_body = SeqStmt::Flatten(new_main_func_body);
       }
       new_main_func_body =
           Allocate(current_alloc->buffer_var, current_alloc->dtype, current_alloc->extents,
@@ -152,9 +193,8 @@ class HoistAllocatesMutator : public StmtExprMutator {
                    current_alloc->span);
     }
 
-    PrimFunc new_main_func =
-        PrimFunc(main_func->params, new_main_func_body, main_func->ret_type, main_func->buffer_map,
-                 main_func->preflattened_buffer_map, main_func->attrs);
+    PrimFunc new_main_func = PrimFunc(main_func->params, new_main_func_body, main_func->ret_type,
+                                      main_func->buffer_map, main_func->attrs);
     return new_main_func;
   }
 
@@ -216,13 +256,13 @@ class CopyComputeReorderingMutator : public StmtExprMutator {
   };
 
   Stmt VisitStmt_(const SeqStmtNode* op) override {
-    if (op->size() <= 1) {
+    auto [seq, rewrap_nest] = FlattenUnwrap(GetRef<Stmt>(op));
+
+    if (seq.size() <= 1) {
       return StmtExprMutator::VisitStmt_(op);
     }
 
-    auto seq_stmt{GetRef<SeqStmt>(op)};
-    std::vector<Stmt> new_seq(seq_stmt->size());
-    std::copy(seq_stmt->seq.begin(), seq_stmt->seq.end(), new_seq.begin());
+    std::vector<Stmt> new_seq(seq.begin(), seq.end());
 
     // Reorder the copies and computes based on the cycle count
     if (_reorder_by_cycles) {
@@ -325,9 +365,7 @@ class CopyComputeReorderingMutator : public StmtExprMutator {
       }
     }
 
-    auto seq_stmt_node{CopyOnWrite(op)};
-    seq_stmt_node->seq = std::move(new_seq);
-    return Stmt{seq_stmt_node};
+    return MergeNest(rewrap_nest, SeqStmt::Flatten(new_seq));
   }
 
   bool stmt_is_global_copy(const Stmt& stmt) { return GetStmtType(stmt) == StmtType::global_copy; }
@@ -434,12 +472,13 @@ class MergeConstantsInfoExtractor : public StmtExprVisitor {
   }
 
   void VisitStmt_(const SeqStmtNode* op) override {
-    if (op->size() <= 1) {
+    std::vector<Stmt> seq_stmt = FlattenUnwrap(GetRef<Stmt>(op)).seq;
+
+    if (seq_stmt.size() <= 1) {
       StmtExprVisitor::VisitStmt_(op);
       return;
     }
 
-    auto seq_stmt{GetRef<SeqStmt>(op)};
     for (size_t i = 0; i < seq_stmt.size(); ++i) {
       Stmt stmt{seq_stmt[i]};
       switch (GetStmtType(stmt)) {
@@ -514,7 +553,7 @@ class MergeConstantsMutator : public StmtExprMutator {
 
     // Make the new const dict
     Array<Array<IntImm>> args_to_merge{GetArgsToMerge(main_func->buffer_map, main_func->params)};
-    Array<Array<IntImm>> buffers_to_merge{
+    Map<IntImm, Array<IntImm>> buffers_to_merge{
         GetArgsToMergeWithoutArgsNotInConstDict(args_to_merge, const_dict)};
     Map<IntImm, runtime::NDArray> new_const_dict{MakeNewConstDict(buffers_to_merge, const_dict)};
 
@@ -523,7 +562,6 @@ class MergeConstantsMutator : public StmtExprMutator {
     prim_func_node->body = std::move(new_body);
     prim_func_node->buffer_map = std::move(new_buffer_map);
     prim_func_node->params = std::move(new_params);
-    prim_func_node->preflattened_buffer_map = {};
     PrimFunc f{GetRef<PrimFunc>(prim_func_node)};
 
     // Add the new const dict as an attribute
@@ -595,12 +633,13 @@ class MergeConstantsMutator : public StmtExprMutator {
   }
 
   Stmt VisitStmt_(const SeqStmtNode* op) override {
-    if (op->size() <= 1) {
+    std::vector<Stmt> seq_stmt = FlattenUnwrap(GetRef<Stmt>(op)).seq;
+
+    if (seq_stmt.size() <= 1) {
       return StmtExprMutator::VisitStmt_(op);
     }
 
     Array<Stmt> new_seq{};
-    SeqStmt seq_stmt{GetRef<SeqStmt>(op)};
     for (size_t i{0}; i < seq_stmt.size(); ++i) {
       Stmt stmt{seq_stmt[i]};
 
@@ -630,7 +669,7 @@ class MergeConstantsMutator : public StmtExprMutator {
         }
       }
     }
-    return SeqStmt(new_seq, op->span);
+    return SeqStmt::Flatten(new_seq);
   }
 
   /*! Returns the variables of the buffers written by copies */
@@ -832,9 +871,11 @@ class MergeConstantsMutator : public StmtExprMutator {
     return vector;
   }
 
-  Array<Array<IntImm>> GetArgsToMergeWithoutArgsNotInConstDict(
+  Map<IntImm, Array<IntImm>> GetArgsToMergeWithoutArgsNotInConstDict(
       const Array<Array<IntImm>>& args_to_merge, const Map<IntImm, runtime::NDArray>& const_dict) {
-    Array<Array<IntImm>> new_args_to_merge{};
+    Map<IntImm, Array<IntImm>> new_args_to_merge{};
+    bool first_arg_found = false;
+    int64_t new_arg_key = 0;  // the updated key of the merged const_dict
     for (Array<IntImm> args : args_to_merge) {
       IntImm key{args[0]};
       auto it = std::find_if(const_dict.begin(), const_dict.end(),
@@ -842,21 +883,29 @@ class MergeConstantsMutator : public StmtExprMutator {
                                return pair.first->value == key->value;
                              });
       if (it != const_dict.end()) {
-        new_args_to_merge.push_back(args);
+        if (first_arg_found == false) {
+          first_arg_found = true;
+          new_arg_key = key->value;
+        }
+        new_args_to_merge.Set(IntImm(DataType::Int(64), new_arg_key), args);
+      }
+      if (first_arg_found) {
+        new_arg_key++;
       }
     }
     return new_args_to_merge;
   }
 
-  Map<IntImm, runtime::NDArray> MakeNewConstDict(const Array<Array<IntImm>>& args_to_merge,
+  Map<IntImm, runtime::NDArray> MakeNewConstDict(const Map<IntImm, Array<IntImm>>& args_to_merge,
                                                  Map<IntImm, runtime::NDArray> const_dict) {
     Map<IntImm, runtime::NDArray> new_const_dict{};
     if (args_to_merge.size() == 0) {
       return new_const_dict;
     }
 
-    int64_t key = args_to_merge[0][0]->value;
-    for (Array<IntImm> args : args_to_merge) {
+    for (auto const& elem : args_to_merge) {
+      IntImm key = elem.first;
+      Array<IntImm> args = elem.second;
       int64_t size = 0;
       for (IntImm arg : args) {
         auto it = std::find_if(const_dict.begin(), const_dict.end(),
@@ -876,8 +925,7 @@ class MergeConstantsMutator : public StmtExprMutator {
         arg_constant.CopyToBytes(static_cast<uint8_t*>(constant->data) + offset, nbytes);
         offset += nbytes;
       }
-      new_const_dict.Set(IntImm(DataType::Int(64), key), constant);
-      key += 1;
+      new_const_dict.Set(key, constant);
     }
     return new_const_dict;
   }

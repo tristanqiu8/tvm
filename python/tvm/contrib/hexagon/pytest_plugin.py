@@ -40,7 +40,7 @@ ADB_SERVER_SOCKET = "ADB_SERVER_SOCKET"
 RNG_SEEDED = False
 
 HEXAGON_AOT_LLVM_TARGET = (
-    "llvm -keys=hexagon "
+    "llvm -keys=hexagon,cpu "
     "-mattr=+hvxv68,+hvx-length128b,+hvx-qfloat,-hvx-ieee-fp "
     "-mcpu=hexagonv68 -mtriple=hexagon"
 )
@@ -309,7 +309,7 @@ def terminate_rpc_servers():
         os.system("ps ax | grep tvm_rpc_x86 | awk '{print $1}' | xargs kill")
 
 
-aot_host_target = tvm.testing.parameter("c", HEXAGON_AOT_LLVM_TARGET)
+aot_host_target = tvm.testing.parameter(HEXAGON_AOT_LLVM_TARGET)
 
 
 @tvm.testing.fixture
@@ -345,8 +345,6 @@ def clear_logcat(request) -> bool:
 def pytest_addoption(parser):
     """Add pytest options."""
 
-    parser.addoption("--gtest_args", action="store", default="")
-
     parser.addoption(
         "--skip-rpc",
         action="store_true",
@@ -372,9 +370,3 @@ def pytest_addoption(parser):
         default=False,
         help="If set true, it will clear logcat before execution.",
     )
-
-
-def pytest_generate_tests(metafunc):
-    option_value = metafunc.config.option.gtest_args
-    if "gtest_args" in metafunc.fixturenames and option_value is not None:
-        metafunc.parametrize("gtest_args", [option_value])

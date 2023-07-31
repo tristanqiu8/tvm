@@ -22,8 +22,8 @@ from tvm.script import tir as T
 def test_pass_simple():
     @T.prim_func
     def element_wise(
-        A: T.Buffer[(128, 128), "float32"],
-        C: T.Buffer[(128, 128), "float32"],
+        A: T.Buffer((128, 128), "float32"),
+        C: T.Buffer((128, 128), "float32"),
     ):
         B = T.alloc_buffer((128, 128), "float32")
         for i, j in T.grid(128, 128):
@@ -36,13 +36,14 @@ def test_pass_simple():
                 C[i, j] = B[i, j] * 2.0
 
     assert tvm.tir.analysis.verify_well_formed(element_wise)
+    assert tvm.tir.analysis.verify_well_formed(tvm.IRModule.from_expr(element_wise))
 
 
 def test_fail_use_out_loop_var():
     @T.prim_func
     def element_wise(
-        A: T.Buffer[(128, 128), "float32"],
-        B: T.Buffer[(128, 128), "float32"],
+        A: T.Buffer((128, 128), "float32"),
+        B: T.Buffer((128, 128), "float32"),
     ):
         for i, j in T.grid(128, 128):
             with T.block("B"):

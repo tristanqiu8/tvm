@@ -192,6 +192,7 @@ class ConstructNetworkVisitor : public MixedModeVisitor, private ErrorReportingP
   sl::TensorsAndId HandleCall(const CallNode*);
 
   void VisitExpr_(const CallNode* cn) final;
+  void VisitExpr_(const ConstantNode* cn) final;
   void VisitExpr_(const TupleNode* op) final;
   void VisitExpr_(const TupleGetItemNode* tg) final;
   void VisitLeaf(const Expr& expr) final;
@@ -252,6 +253,7 @@ struct EthosnCompilerConfigNode : public tvm::AttrsNode<EthosnCompilerConfigNode
   bool disable_winograd;
   String debug_dir;
   bool inline_non_compute_intensive_partitions;
+  bool experimental_compiler;
 
   TVM_DECLARE_ATTRS(EthosnCompilerConfigNode, "ext.attrs.EthosnCompilerConfigNode") {
     TVM_ATTR_FIELD(variant).describe("See Ethos-N documentation.").set_default("n78");
@@ -285,6 +287,9 @@ struct EthosnCompilerConfigNode : public tvm::AttrsNode<EthosnCompilerConfigNode
             "Ethos(TM)-N that are deemed 'non-compute-intensive'. The inlined functions will "
             "continue through TVM's standard compilation flow.")
         .set_default(true);
+    TVM_ATTR_FIELD(experimental_compiler)
+        .describe("An exprimental cascading compiler for Arm(R) Ethos(TM)-N.")
+        .set_default(false);
   }
 };
 
@@ -296,13 +301,14 @@ class EthosnCompilerConfig : public Attrs {
 TVM_REGISTER_NODE_TYPE(EthosnCompilerConfigNode);
 TVM_REGISTER_PASS_CONFIG_OPTION("relay.ext.ethos-n.options", EthosnCompilerConfig);
 
-auto GetCompilerAttrs() {
+EthosnCompilerConfig GetCompilerAttrs() {
   auto ctx = transform::PassContext::Current();
-  auto cfg = ctx->GetConfig<EthosnCompilerConfig>("relay.ext.ethos-n.options");
+  Optional<EthosnCompilerConfig> cfg =
+      ctx->GetConfig<EthosnCompilerConfig>("relay.ext.ethos-n.options");
   if (!cfg.defined()) {
-    cfg = AttrsWithDefaultValues<EthosnCompilerConfig>();
+    return AttrsWithDefaultValues<EthosnCompilerConfig>();
   }
-  return cfg;
+  return cfg.value();
 }
 TVM_REGISTER_GLOBAL("relay.ext.ethos-n.get_compiler_attrs").set_body_typed(GetCompilerAttrs);
 

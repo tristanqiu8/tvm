@@ -486,7 +486,7 @@ def get_conv3d_transpose(
     activation=None,
     dtype="float32",
     data_layout="NCDHW",
-    kernel_layout="OIDHW",
+    kernel_layout="IODHW",
 ):
     x = relay.var("x", shape=(x_shape), dtype=dtype)
     kernel = relay.const(np.random.randint(0, 1, k_shape).astype(dtype))
@@ -828,6 +828,32 @@ def test_conv2d_bias_sum_relu(run_module, dtype="float32"):
     conv2d_bn_sum_relu, dic, param_lst = get_conv2d_bn_sum_relu(x_shape, k_shape, dtype=dtype)
     conv2d_bn_sum_relu = tvm.IRModule.from_expr(conv2d_bn_sum_relu)
     config = conv2d_bn_sum_relu, dic, param_lst
+    run_and_verify_func(config, run_module=run_module, dtype=dtype)
+
+
+def test_dense_bias_sum(run_module, dtype="float32"):
+    x_shape = (4, 32)
+    k_shape = (16, 32)
+
+    def get_dense_bias_sum(x_shape, k_shape, dtype="float32"):
+        out, dic, param_lst = get_dense_bias(x_shape=x_shape, k_shape=k_shape, dtype=dtype)
+
+        sum_in = relay.var("sum_in", shape=x_shape, dtype=dtype)
+        ker = relay.var("ker", shape=(k_shape), dtype=dtype)
+        dense_sum = relay.nn.dense(sum_in, ker, units=k_shape[0])
+
+        # sum over two dense outputs to meet inplace condition
+        out = relay.add(out, dense_sum)
+        dic["sum_in"] = x_shape
+        dic["ker"] = k_shape
+        param_lst += ["ker"]
+        return out, dic, param_lst
+
+    dense_bias_sum, dic, param_lst = get_dense_bias_sum(x_shape, k_shape, dtype=dtype)
+    dense_bias_sum = tvm.IRModule.from_expr(dense_bias_sum)
+    print("hebi-dbg:")
+    print(dense_bias_sum)
+    config = dense_bias_sum, dic, param_lst
     run_and_verify_func(config, run_module=run_module, dtype=dtype)
 
 

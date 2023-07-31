@@ -53,9 +53,9 @@ import tvm.testing
 from tvm import te, topi, tir
 from tvm.topi import testing
 from tvm.contrib.hexagon.session import Session
+from tvm.contrib.hexagon import allocate_hexagon_array
 
-
-from .infrastructure import allocate_hexagon_array, get_hexagon_target
+from .infrastructure import get_hexagon_target
 from . import benchmark_util as bu
 
 # Pytest seems to require that fixture names exist in the current module.
@@ -328,13 +328,13 @@ class TestMaxPool2D:
 
             except bu.NumericalAccuracyException as exception:
                 print()
-                print(f"FAIL: Numerical accuracy error. See log file.")
+                print("FAIL: Numerical accuracy error. See log file.")
 
                 log_file.write("\n")
                 log_file.write(f"FAIL: {exception}\n")
 
                 self.benchmark_table.record_fail(
-                    **keys_dict, comments=f"Numerical accuracy error. See log file."
+                    **keys_dict, comments="Numerical accuracy error. See log file."
                 )
 
             except bu.UnsupportedException as exception:

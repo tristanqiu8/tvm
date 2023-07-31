@@ -57,7 +57,6 @@ static inline int32_t GetQmin(const DataType& dtype) {
     return static_cast<int32_t>(min_value[0]);
   } else {
     LOG(FATAL) << "Type not supported " << dtype;
-    return -1;  // To hide the warning
   }
 }
 
@@ -70,7 +69,6 @@ static inline int32_t GetQmax(const DataType& dtype) {
     return static_cast<int32_t>(max_value[0]);
   } else {
     LOG(FATAL) << "Type not supported " << dtype;
-    return -1;  // To hide the warning
   }
 }
 
@@ -137,7 +135,8 @@ static inline Expr Dequantize(const Expr& data, const Expr& input_scale,
 
   return DequantizeLower(data, input_scale, input_zero_point, types, attrs.operator->());
 }
-Expr MakeDequantize(Expr data, Expr input_scale, Expr input_zero_point, int axis);
+Expr MakeDequantize(Expr data, Expr input_scale, Expr input_zero_point, int axis,
+                    DataType out_dtype = DataType::Float(32));
 
 Expr QuantizeLower(const Expr& input_tensor, const Expr& output_scale,
                    const Expr& output_zero_point, const Array<tvm::relay::Type>& types,

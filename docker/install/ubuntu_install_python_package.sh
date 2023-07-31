@@ -25,7 +25,7 @@ pip3 install --upgrade \
     "Pygments>=2.4.0" \
     attrs \
     cloudpickle \
-    cython \
+    cython==0.29.34 \
     decorator \
     mypy \
     numpy==1.21.* \
@@ -41,8 +41,8 @@ pip3 install --upgrade \
     requests \
     scipy \
     Jinja2 \
-    synr==0.6.0 \
     junitparser==2.4.2 \
     six \
     tornado \
-    pytest-lazy-fixture
+    pytest-lazy-fixture \
+    ml_dtypes

@@ -21,10 +21,10 @@ from tvm.script import tir as T
 
 def _check(original, transformed):
     func = original
-    mod = tvm.IRModule.from_expr(func)
+    mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
     mod = tvm.tir.transform.ConvertBlocksToOpaque()(mod)
     mod = tvm.tir.transform.Simplify()(mod)
-    tvm.ir.assert_structural_equal(mod["main"], transformed)
+    tvm.ir.assert_structural_equal(mod["main"], transformed.with_attr("global_symbol", "main"))
 
 
 @T.prim_func
@@ -85,7 +85,7 @@ def test_lower_te():
 class TestErrorIfPredicateUsesBlockVariables(tvm.testing.CompareBeforeAfter):
     transform = tvm.tir.transform.ConvertBlocksToOpaque()
 
-    def before(A: T.Buffer[8, "int32"]):
+    def before(A: T.Buffer(8, "int32")):
         for i in T.serial(8):
             with T.block():
                 vi = T.axis.remap("S", [i])

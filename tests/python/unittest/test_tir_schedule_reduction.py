@@ -22,7 +22,10 @@ import tvm
 import tvm.testing
 from tvm import tir
 from tvm.script import tir as T
-from tvm.tir.schedule.testing import verify_trace_roundtrip
+from tvm.tir.schedule.testing import (
+    verify_trace_roundtrip,
+    assert_structural_equal_ignore_global_symbol,
+)
 
 # pylint: disable=no-member,invalid-name,unused-variable,unexpected-keyword-arg
 
@@ -223,7 +226,7 @@ def test_reduction_decompose0(use_block_name):
     C = "update" if use_block_name else s.get_block("update")
     i, j, k = s.get_loops(C)
     s.decompose_reduction(C, i)
-    tvm.ir.assert_structural_equal(matmul_decompose0, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(matmul_decompose0, s.mod["main"])
     verify_trace_roundtrip(s, mod=matmul)
 
 
@@ -232,7 +235,7 @@ def test_reduction_decompose1(use_block_name):
     blockized_B = "blockized_B" if use_block_name else s.get_block("blockized_B")
     io, ko = s.get_loops(blockized_B)
     s.decompose_reduction(blockized_B, io)
-    tvm.ir.assert_structural_equal(matmul_decompose1, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(matmul_decompose1, s.mod["main"])
     verify_trace_roundtrip(s, mod=rowsum_blockized)
 
 
@@ -241,7 +244,7 @@ def test_reduction_decompose2():
     C = s.get_block("update")
     i, j, k = s.get_loops(C)
     s.decompose_reduction(C, k)
-    tvm.ir.assert_structural_equal(matmul_decompose2, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(matmul_decompose2, s.mod["main"])
     verify_trace_roundtrip(s, mod=matmul)
 
 
@@ -260,7 +263,7 @@ def test_reduction_decompose4():
     io, ii = s.split(i, factors=[16, 8])
     ko, ki = s.split(k, factors=[19, 7])
     s.decompose_reduction(C, ii)
-    tvm.ir.assert_structural_equal(matmul_decompose4, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(matmul_decompose4, s.mod["main"])
     verify_trace_roundtrip(s, mod=matmul)
 
 
@@ -269,7 +272,7 @@ def test_reduction_decompose_with_annotation():
     C = s.get_block("update")
     i, j, k = s.get_loops(C)
     s.decompose_reduction(C, i)
-    tvm.ir.assert_structural_equal(matmul_decompose_with_annotation, s.mod["main"])
+    assert_structural_equal_ignore_global_symbol(matmul_decompose_with_annotation, s.mod["main"])
     verify_trace_roundtrip(s, mod=matmul_with_annotation)
 
 
@@ -278,14 +281,14 @@ def test_reduction_decompose_with_different_for_kind():
     B = s.get_block("B")
     k, _ = s.get_loops(B)
     B_init = s.decompose_reduction(B, k)
-    tvm.ir.assert_structural_equal(s.mod["main"], colsum_decompose_with_vectorization)
+    assert_structural_equal_ignore_global_symbol(s.mod["main"], colsum_decompose_with_vectorization)
     assert s.get(B).same_as(s.get(s.get_block("B_update")))
     assert s.get(B_init).same_as(s.get(s.get_block("B_init")))
     verify_trace_roundtrip(s, mod=colsum_with_vectorization)
 
 
 def test_decompose_reduction_ref_hash_check():
-    mod = tvm.IRModule.from_expr(matmul)
+    mod = tvm.IRModule.from_expr(matmul.with_attr("global_symbol", "main"))
     mod_bak = mod
     hash_before = tvm.ir.structural_hash(mod_bak)
     s = tir.Schedule(mod["main"], debug_mask="all")
@@ -294,6 +297,60 @@ def test_decompose_reduction_ref_hash_check():
     s.decompose_reduction(C, k)
     hash_after = tvm.ir.structural_hash(mod_bak)
     assert hash_before == hash_after
+
+
+def test_decompose_reduction_nested_block():
+    @T.prim_func
+    def nested_block(A: T.Buffer((1, 64), "float32"), B: T.Buffer((1,), "float32")):
+        for i, ko in T.grid(1, 2):
+            with T.block("outer"):
+                vi, vko = T.axis.remap("SR", [i, ko])
+                C = T.alloc_buffer((32,), dtype="float32")
+                with T.init():
+                    B[vi] = T.float32(0)
+                for ki in T.serial(32):
+                    with T.block("inner_1"):
+                        vki = T.axis.remap("S", [ki])
+                        C[vki] = A[vi, vko * 32 + vki]
+                for ki in T.serial(32):
+                    with T.block("inner_2"):
+                        vki = T.axis.remap("R", [ki])
+                        B[vi] += C[vki]
+
+    @T.prim_func
+    def decomposed_nested_block(A: T.Buffer((1, 64), "float32"), B: T.Buffer((1,), "float32")):
+        for i in range(1):
+            with T.block("outer_init"):
+                vi = T.axis.spatial(1, i)
+                T.reads()
+                T.writes(B[vi])
+                B[vi] = T.float32(0)
+            for ko in range(2):
+                with T.block("outer_update"):
+                    vi, vko = T.axis.remap("SR", [i, ko])
+                    T.reads(B[vi], A[vi, vko * 32 : vko * 32 + 32])
+                    T.writes(B[vi])
+                    C = T.alloc_buffer((32,))
+                    for ki in range(32):
+                        with T.block("inner_1"):
+                            vki = T.axis.spatial(32, ki)
+                            T.reads(A[vi, vko * 32 + vki])
+                            T.writes(C[vki])
+                            C[vki] = A[vi, vko * 32 + vki]
+                    for ki in range(32):
+                        with T.block("inner_2"):
+                            vki = T.axis.reduce(32, ki)
+                            T.reads(B[vi], C[vki])
+                            T.writes(B[vi])
+                            B[vi] = B[vi] + C[vki]
+
+    sch = tir.Schedule(nested_block, debug_mask="all")
+    outer = sch.get_block("outer")
+    i, ko = sch.get_loops(outer)
+    sch.decompose_reduction(outer, ko)
+
+    assert_structural_equal_ignore_global_symbol(decomposed_nested_block, sch.mod["main"])
+    verify_trace_roundtrip(sch, mod=nested_block)
 
 
 if __name__ == "__main__":

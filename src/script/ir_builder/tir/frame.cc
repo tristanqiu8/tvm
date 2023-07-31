@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#include <tvm/script/ir_builder/ir/ir.h>
 #include <tvm/script/ir_builder/tir/frame.h>
 #include <tvm/tir/function.h>
 
@@ -29,12 +30,27 @@ namespace tir {
 
 void PrimFuncFrameNode::ExitWithScope() {
   TIRFrameNode::ExitWithScope();
+  // if the prim func is not private and there isn't already a global symbol,
+  // add a global symbol
+  if (!is_private && name.defined()) {
+    if (!attrs.defined()) {
+      attrs = {{tvm::attr::kGlobalSymbol, name.value()}};
+    } else if (!attrs.value().count(tvm::attr::kGlobalSymbol)) {
+      // copy over attributes (can't mutate the dict inside the optional in-place)
+      Map<String, ObjectRef> new_attrs;
+      for (auto kv : attrs.value()) {
+        new_attrs.Set(kv.first, kv.second);
+      }
+      new_attrs.Set(tvm::attr::kGlobalSymbol, name.value());
+      attrs = std::move(new_attrs);
+    }
+  }
+
   tvm::tir::PrimFunc func(
       /*params=*/args,
       /*body=*/AsStmt(stmts),
       /*ret_type=*/ret_type.value_or(TupleType::Empty()),
       /*buffer_map=*/buffer_map,
-      /*preflattened_buffer_map=*/preflattened_buffer_map,
       /*attrs=*/attrs.defined() ? DictAttrs(attrs.value()) : NullValue<DictAttrs>());
   func = tvm::tir::ScriptComplete(func, root_alloc_buffers);
   IRBuilder builder = IRBuilder::Current();
@@ -42,9 +58,17 @@ void PrimFuncFrameNode::ExitWithScope() {
     ICHECK(!builder->result.defined()) << "ValueError: Builder.result has already been set";
     builder->result = func;
   } else if (Optional<ir::IRModuleFrame> opt_frame = builder->FindFrame<ir::IRModuleFrame>()) {
-    ir::IRModuleFrame frame = opt_frame.value();
-    frame->global_vars.push_back(GlobalVar(name.value_or("")));
-    frame->functions.push_back(func);
+    CHECK(name.defined()) << "ValueError: The function name must be defined before exiting the "
+                             "function scope, if it's defined in a Module";
+    const ir::IRModuleFrame& frame = opt_frame.value();
+    const String& func_name = name.value_or("");
+    if (!frame->global_var_map.count(func_name)) {
+      // Case. First time visiting the function.
+      ir::DeclFunction(func_name, func);
+    }
+    // Define the function.
+    // Note we do checks to disallow redefinition of functions inside the `DefFunction`.
+    ir::DefFunction(func_name, func);
   } else {
     LOG(FATAL) << "ValueError: Cannot find where to insert PrimFunc";
   }
@@ -117,14 +141,14 @@ void LaunchThreadFrameNode::ExitWithScope() {
 
 void AllocateFrameNode::ExitWithScope() {
   TIRFrameNode::ExitWithScope();
-  AddToParent(tvm::tir::Allocate(buffer->data, buffer->dtype, buffer->shape, condition,
-                                 AsStmt(stmts), annotations));
+  AddToParent(
+      tvm::tir::Allocate(buffer_var, dtype, extents, condition, AsStmt(stmts), annotations));
 }
 
 void AllocateConstFrameNode::ExitWithScope() {
   TIRFrameNode::ExitWithScope();
   AddToParent(
-      tvm::tir::AllocateConst(buffer->data, dtype, extents, data, AsStmt(stmts), annotations));
+      tvm::tir::AllocateConst(buffer_var, dtype, extents, data, AsStmt(stmts), annotations));
 }
 void AttrFrameNode::ExitWithScope() {
   TIRFrameNode::ExitWithScope();
@@ -182,7 +206,13 @@ void ElseFrameNode::ExitWithScope() {
 
 void DeclBufferFrameNode::ExitWithScope() {
   TIRFrameNode::ExitWithScope();
-  AddToParent(tvm::tir::DeclBuffer(buffer, AsStmt(stmts)));
+  if (allocated) {
+    AddToParent(tvm::tir::DeclBuffer(buffer, AsStmt(stmts)));
+  } else {
+    AddToParent(tvm::tir::Allocate(buffer->data, buffer->dtype, buffer->shape,
+                                   tvm::IntImm(DataType::Bool(), 1),
+                                   tvm::tir::DeclBuffer(buffer, AsStmt(stmts))));
+  }
 }
 
 TVM_REGISTER_NODE_TYPE(TIRFrameNode);

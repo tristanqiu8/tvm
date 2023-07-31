@@ -76,10 +76,17 @@ InferCorrectLayoutOutput RequantizeInferCorrectLayout(const Attrs& attrs,
       if (old_dim == layout_dim) {
         new_axis = tvm::Integer(axis_index);
       }
-      // Collect only the primal axis.
+
       if (layout_axis.IsPrimal()) {
         new_layout_string += layout_dim;
         axis_index++;
+      } else {
+        // Propogate layout if input_zero_point and input_scale are scalar values.
+        ICHECK_GE(old_in_types.size(), 3);
+        if (IsScalarType(old_in_types[1]) && IsScalarType(old_in_types[2])) {
+          new_layout_string += std::to_string(new_in_layouts[0].FactorOf(layout_axis)) + layout_dim;
+          axis_index++;
+        }
       }
     }
 
@@ -117,8 +124,8 @@ bool has_current_target_sse41_support() {
   auto target = Target::Current(true);
   Optional<String> mcpu =
       target.defined() ? target->GetAttr<String>("mcpu") : Optional<String>(nullptr);
-  auto target_has_sse41_fn_ptr = tvm::runtime::Registry::Get("tvm.topi.x86.utils.target_has_sse41");
-  ICHECK(target_has_sse41_fn_ptr) << "Function tvm.topi.x86.utils.target_has_sse41 not found";
+  auto target_has_sse41_fn_ptr = tvm::runtime::Registry::Get("tvm.target.x86.target_has_sse41");
+  ICHECK(target_has_sse41_fn_ptr) << "Function tvm.target.x86.target_has_sse41 not found";
   return mcpu && (*target_has_sse41_fn_ptr)(mcpu.value());
 }
 
@@ -384,6 +391,9 @@ Expr RequantizeLower(const Expr& input_tensor, const Expr& input_scale,
                      const Expr& input_zero_point, const Expr& output_scale,
                      const Expr& output_zero_point, const RequantizeAttrs* param,
                      const Array<IndexExpr>& input_shape, const DataType& out_dtype) {
+  // Check output scale validity.
+  ICHECK_NE(GetScalarFromConstant<float>(output_scale), 0.0)
+      << "QNN requantize output scale can not be equal to 0.0";
   // Check rounding validity.
   ICHECK(param->rounding == "UPWARD" || param->rounding == "TONEAREST")
       << "QNN requantize supports two rounding modes - UPWARD and "
@@ -480,8 +490,9 @@ bool RequantizeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   }
   const auto in_dtype = data->dtype;
   ICHECK(in_dtype == DataType::Int(8) || in_dtype == DataType::UInt(8) ||
-         in_dtype == DataType::Int(32) || in_dtype == DataType::Int(64))
-      << "Input type should be one of [int8, uint8, int32, int64] but was " << in_dtype;
+         in_dtype == DataType::Int(16) || in_dtype == DataType::Int(32) ||
+         in_dtype == DataType::Int(64))
+      << "Input type should be one of [int8, uint8, int16, int32, int64] but was " << in_dtype;
 
   const RequantizeAttrs* requantize_attrs = attrs.as<RequantizeAttrs>();
   int axis = requantize_attrs->axis;

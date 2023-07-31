@@ -15,10 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 """Integration test for MetaSchedule"""
-from typing import List
+import platform
 import tempfile
+from typing import List
+
 import numpy as np
 import pytest
+
 import tvm
 import tvm.testing
 from tvm import IRModule
@@ -27,7 +30,7 @@ from tvm import relay, te, tir
 from tvm._ffi import register_func
 from tvm.contrib import graph_executor
 from tvm.ir.transform import PassContext
-from tvm.meta_schedule.database import Workload, TuningRecord
+from tvm.meta_schedule.database import TuningRecord, Workload
 from tvm.meta_schedule.testing.relay_workload import get_network
 from tvm.meta_schedule.testing.tlcbench import load_quantized_bert_base
 from tvm.meta_schedule.tune_context import _normalize_mod
@@ -53,16 +56,7 @@ class MockModule:
 # pylint: enable=no-member,line-too-long,too-many-nested-blocks,unbalanced-tuple-unpacking,no-self-argument
 
 
-def _has_torch():
-    import importlib.util  # pylint: disable=unused-import,import-outside-toplevel
-
-    spec = importlib.util.find_spec("torch")
-    return spec is not None
-
-
-requires_torch = pytest.mark.skipif(not _has_torch(), reason="torch is not installed")
-
-
+@pytest.mark.skip("Integration tests")
 def test_meta_schedule_dynamic_loop_extent():
     a = relay.var("a", shape=(1, 8, 8, 512), dtype="float32")
     b = relay.nn.adaptive_avg_pool2d(a, (7, 7), "NHWC")
@@ -71,7 +65,12 @@ def test_meta_schedule_dynamic_loop_extent():
     assert not extracted_tasks
 
 
-@requires_torch
+@pytest.mark.skip("Integration tests")
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Currently torch.jit.trace fails on AArch64",
+)
+@tvm.testing.requires_package("torch")
 def test_meta_schedule_integration_extract_from_resnet():
     mod, params, _ = get_network(name="resnet_18", input_shape=[1, 3, 224, 224])
     extracted_tasks = ms.relay_integration.extract_tasks(mod, target="llvm", params=params)
@@ -107,7 +106,35 @@ def test_meta_schedule_integration_extract_from_resnet():
         assert t.task_name in expected_task_names, t.task_name
 
 
-@requires_torch
+@pytest.mark.skip("Integration tests")
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Currently torch.jit.trace fails on AArch64",
+)
+@tvm.testing.requires_package("torch")
+def test_task_extraction_winograd_tensorcore():
+    mod, params, _ = get_network(name="resnet_50", input_shape=[16, 3, 224, 224])
+    seq = tvm.transform.Sequential(
+        [
+            relay.transform.ToMixedPrecision("float16"),
+            relay.transform.ConvertLayout({"nn.conv2d": ["NHWC", "HWIO"]}),
+        ]
+    )
+    with tvm.transform.PassContext(opt_level=3):
+        mod = seq(mod)
+
+    target = tvm.target.Target("nvidia/geforce-rtx-3070")
+    extracted_tasks = ms.relay_integration.extract_tasks(mod, target=target, params=params)
+
+    assert len([t for t in extracted_tasks if "winograd" in t.task_name]) == 4
+
+
+@pytest.mark.skip("Integration tests")
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Currently torch.jit.trace fails on AArch64",
+)
+@tvm.testing.requires_package("torch")
 def test_task_extraction_anchor_block():
     mod, params, _ = get_network(name="resnet_18", input_shape=[1, 3, 224, 224])
     extracted_tasks = ms.relay_integration.extract_tasks(
@@ -142,7 +169,8 @@ def test_task_extraction_anchor_block():
         assert t.task_name in expected_task_names, t.task_name
 
 
-@requires_torch
+@pytest.mark.skip("Integration tests")
+@tvm.testing.requires_package("torch")
 def test_meta_schedule_integration_extract_from_bert_base():
     pytest.importorskip(
         "transformers", reason="transformers package is required to import bert_base"
@@ -240,7 +268,12 @@ def test_meta_schedule_integration_extract_from_bert_base():
         assert expected_shape == shape, t.task_name
 
 
-@requires_torch
+@pytest.mark.skip("Integration tests")
+@pytest.mark.skipif(
+    platform.machine() == "aarch64",
+    reason="Currently torch.jit.trace fails on AArch64",
+)
+@tvm.testing.requires_package("torch")
 def test_meta_schedule_integration_extract_from_resnet_with_filter_func():
     @register_func("relay.backend.tir_converter.remove_purely_spatial", override=True)
     def filter_func(args, _) -> bool:
@@ -307,9 +340,8 @@ def test_meta_schedule_integration_extract_from_resnet_with_filter_func():
         assert t.task_name in expected_task_names, t.task_name
 
 
-@pytest.mark.skip("Too slow on CI")
-def extract_task_qbert():
-    def _test(mod, params, target):
+def extract_task_qbert(target, sch_rule_tag):
+    def _test(mod, params, target, sch_rule_tag):
         extracted_tasks = ms.relay_integration.extract_tasks(mod, target, params)
         tune_tasks = list(
             filter(
@@ -332,13 +364,23 @@ def extract_task_qbert():
             annotations = sch.get(block).annotations
 
             assert "schedule_rule" in annotations
-            assert "vnni" in annotations["schedule_rule"]
-        ...
+            assert sch_rule_tag in annotations["schedule_rule"]
 
     mod, params, _ = load_quantized_bert_base(batch_size=1, seq_len=128)
-    _test(mod, params, target="llvm -mcpu=cascadelake")
+    _test(mod, params, target=target, sch_rule_tag=sch_rule_tag)
 
 
+@pytest.mark.skip("Too slow on CI")
+def extract_task_qbert_vnni():
+    extract_task_qbert("llvm -mcpu=cascadelake", "vnni")
+
+
+@pytest.mark.skip("Too slow on CI")
+def extract_task_qbert_avx512():
+    extract_task_qbert("llvm -mcpu=skylake-avx512", "avx512")
+
+
+@pytest.mark.skip("Integration tests")
 @tvm.testing.skip_if_32bit(reason="Apparently the LLVM version on i386 image is too old")
 def test_extract_task_arm_conv2d_nchwc():
     data_shape = (1, 64, 128, 128)
@@ -384,6 +426,7 @@ def test_extract_task_arm_conv2d_nchwc():
     assert list(out_type.shape) == [1, 8, 130, 130, 4]
 
 
+@pytest.mark.skip("Integration tests")
 def test_meta_schedule_te2primfunc_argument_order_and_lowering():
     # pylint: disable=invalid-name,no-member,line-too-long,too-many-nested-blocks,no-self-argument
     # fmt: off
@@ -391,21 +434,22 @@ def test_meta_schedule_te2primfunc_argument_order_and_lowering():
     class _fused_layout_transform:
         @T.prim_func
         def main( # type: ignore
-            placeholder: T.Buffer[(1, 3, 16, 16), "float32"], # type: ignore
-            T_layout_trans: T.Buffer[(1, 1, 16, 16, 3), "float32"], # type: ignore
+            placeholder: T.Buffer((T.int64(1), T.int64(3), T.int64(16), T.int64(16)), "float32"), # type: ignore
+            T_layout_trans: T.Buffer((T.int64(1), T.int64(1), T.int64(16), T.int64(16), T.int64(3)), "float32"), # type: ignore
         ) -> None: # type: ignore
             # function attr dict
             T.func_attr({"global_symbol": "main", "tir.noalias": True})
             # body
             # with T.block("root")
-            for i0, i1, i2, i3, i4 in T.grid(1, 1, 16, 16, 3):
+            for i0, i1, i2, i3, i4 in T.grid(T.int64(1), T.int64(1), T.int64(16), T.int64(16), T.int64(3)):
                 with T.block("T_layout_trans"):
                     ax0, ax1, ax2, ax3, ax4 = T.axis.remap("SSSSS", [i0, i1, i2, i3, i4])
-                    T.reads(placeholder[ax0, ax1 * 3 + ax4, ax2, ax3])
+                    T.reads(placeholder[ax0, ax1 * T.int64(3) + ax4, ax2, ax3])
                     T.writes(T_layout_trans[ax0, ax1, ax2, ax3, ax4])
+                    T.block_attr({"dst_layout": "NCHW3c", "input_shape": [1, 3, 16, 16], "schedule_rule": "None", "src_layout": "NCHW"})
                     T_layout_trans[ax0, ax1, ax2, ax3, ax4] = T.if_then_else(
-                        ax0 < 1 and ax1 * 3 + ax4 < 3 and ax2 < 16 and ax3 < 16, # type: ignore
-                        placeholder[ax0, ax1 * 3 + ax4, ax2, ax3],
+                        ax0 < T.int64(1) and ax1 * T.int64(3) + ax4 < T.int64(3) and ax2 < T.int64(16) and ax3 < T.int64(16), # type: ignore
+                        placeholder[ax0, ax1 * T.int64(3) + ax4, ax2, ax3],
                         T.float32(0),
                         dtype="float32",
                     )
@@ -413,42 +457,42 @@ def test_meta_schedule_te2primfunc_argument_order_and_lowering():
     @tvm.script.ir_module
     class _fused_layout_transform_1:
         @T.prim_func
-        def main(placeholder: T.Buffer[(1, 2, 16, 16, 4), "float32"], T_layout_trans: T.Buffer[(1, 8, 16, 16), "float32"]) -> None: # type: ignore
+        def main(placeholder: T.Buffer((T.int64(1), T.int64(2), T.int64(16), T.int64(16), T.int64(4)), "float32"), T_layout_trans: T.Buffer((T.int64(1), T.int64(8), T.int64(16), T.int64(16)), "float32")) -> None: # type: ignore
             # function attr dict
             T.func_attr({"global_symbol": "main", "tir.noalias": True})
             # body
             # with T.block("root")
-            for i0, i1, i2, i3 in T.grid(1, 8, 16, 16):
+            for i0, i1, i2, i3 in T.grid(T.int64(1), T.int64(8), T.int64(16), T.int64(16)):
                 with T.block("T_layout_trans"):
                     ax0, ax1, ax2, ax3 = T.axis.remap("SSSS", [i0, i1, i2, i3])
-                    T.reads(placeholder[ax0, ax1 // 4, ax2, ax3, ax1 % 4]) # type: ignore
+                    T.reads(placeholder[ax0, ax1 // T.int64(4), ax2, ax3, ax1 % T.int64(4)]) # type: ignore
                     T.writes(T_layout_trans[ax0, ax1, ax2, ax3])
-                    T_layout_trans[ax0, ax1, ax2, ax3] = T.if_then_else(ax0 < 1 and ax1 < 8 and ax2 < 16 and ax3 < 16, placeholder[ax0, ax1 // 4, ax2, ax3, ax1 % 4], T.float32(0), dtype="float32") # type: ignore
+                    T.block_attr({"dst_layout": "NCHW", "input_shape": [1, 2, 16, 16, 4], "schedule_rule": "None", "src_layout": "NCHW4c"})
+                    T_layout_trans[ax0, ax1, ax2, ax3] = T.if_then_else(ax0 < T.int64(1) and ax1 < T.int64(8) and ax2 < T.int64(16) and ax3 < T.int64(16), placeholder[ax0, ax1 // T.int64(4), ax2, ax3, ax1 % T.int64(4)], T.float32(0), dtype="float32") # type: ignore
 
     @tvm.script.ir_module
     class _fused_nn_contrib_conv2d_NCHWc:
         @T.prim_func
-        def main(placeholder: T.Buffer[(1, 1, 16, 16, 3), "float32"], placeholder_1: T.Buffer[(2, 1, 5, 5, 3, 4), "float32"], conv2d_NCHWc: T.Buffer[(1, 2, 16, 16, 4), "float32"]) -> None: # type: ignore
+        def main(placeholder: T.Buffer((T.int64(1), T.int64(1), T.int64(16), T.int64(16), T.int64(3)), "float32"), placeholder_1: T.Buffer((T.int64(2), T.int64(1), T.int64(5), T.int64(5), T.int64(3), T.int64(4)), "float32"), conv2d_NCHWc: T.Buffer((T.int64(1), T.int64(2), T.int64(16), T.int64(16), T.int64(4)), "float32")) -> None: # type: ignore
             # function attr dict
             T.func_attr({"global_symbol": "main", "tir.noalias": True})
             # body
             # with T.block("root")
-            data_pad = T.alloc_buffer([1, 1, 20, 20, 3], dtype="float32")
-            for i0, i1, i2, i3, i4 in T.grid(1, 1, 20, 20, 3):
+            data_pad = T.alloc_buffer([T.int64(1), T.int64(1), T.int64(20), T.int64(20), T.int64(3)], dtype="float32")
+            for i0, i1, i2, i3, i4 in T.grid(T.int64(1), T.int64(1), T.int64(20), T.int64(20), T.int64(3)):
                 with T.block("data_pad"):
                     i0_1, i1_1, i2_1, i3_1, i4_1 = T.axis.remap("SSSSS", [i0, i1, i2, i3, i4])
-                    T.reads(placeholder[i0_1, i1_1, i2_1 - 2, i3_1 - 2, i4_1])
+                    T.reads(placeholder[i0_1, i1_1, i2_1 - T.int64(2), i3_1 - T.int64(2), i4_1])
                     T.writes(data_pad[i0_1, i1_1, i2_1, i3_1, i4_1])
-                    data_pad[i0_1, i1_1, i2_1, i3_1, i4_1] = T.if_then_else(2 <= i2_1 and i2_1 < 18 and 2 <= i3_1 and i3_1 < 18, placeholder[i0_1, i1_1, i2_1 - 2, i3_1 - 2, i4_1], T.float32(0), dtype="float32") # type: ignore # pylint: disable=R1716
-            for i0, i1, i2, i3, i4, i5, i6, i7 in T.grid(1, 2, 16, 16, 4, 3, 5, 5):
+                    data_pad[i0_1, i1_1, i2_1, i3_1, i4_1] = T.if_then_else(T.int64(2) <= i2_1 and i2_1 < T.int64(18) and T.int64(2) <= i3_1 and i3_1 < T.int64(18), placeholder[i0_1, i1_1, i2_1 - T.int64(2), i3_1 - T.int64(2), i4_1], T.float32(0), dtype="float32") # type: ignore # pylint: disable=R1716
+            for i0, i1, i2, i3, i4, i5, i6, i7 in T.grid(T.int64(1), T.int64(2), T.int64(16), T.int64(16), T.int64(4), T.int64(3), T.int64(5), T.int64(5)):
                 with T.block("conv2d_NCHWc"):
                     n, oc_chunk, oh, ow, oc_block, ic, kh, kw = T.axis.remap("SSSSSRRR", [i0, i1, i2, i3, i4, i5, i6, i7])
-                    T.reads(data_pad[n, ic // 3, oh + kh, ow + kw, ic % 3], placeholder_1[oc_chunk, ic // 3, kh, kw, ic % 3, oc_block]) # type: ignore
+                    T.reads(data_pad[n, ic // T.int64(3), oh + kh, ow + kw, ic % T.int64(3)], placeholder_1[oc_chunk, ic // T.int64(3), kh, kw, ic % T.int64(3), oc_block]) # type: ignore
                     T.writes(conv2d_NCHWc[n, oc_chunk, oh, ow, oc_block])
-                    T.block_attr({"workload":["conv2d_NCHWc.x86", ["TENSOR", [1, 1, 16, 16, 3], "float32"], ["TENSOR", [2, 1, 5, 5, 3, 4], "float32"], [1, 1], [2, 2, 2, 2], [1, 1], "NCHW3c", "NCHW4c", "float32"]})
                     with T.init():
                         conv2d_NCHWc[n, oc_chunk, oh, ow, oc_block] = T.float32(0)
-                    conv2d_NCHWc[n, oc_chunk, oh, ow, oc_block] = conv2d_NCHWc[n, oc_chunk, oh, ow, oc_block] + data_pad[n, ic // 3, oh + kh, ow + kw, ic % 3] * placeholder_1[oc_chunk, ic // 3, kh, kw, ic % 3, oc_block] # type: ignore
+                    conv2d_NCHWc[n, oc_chunk, oh, ow, oc_block] = conv2d_NCHWc[n, oc_chunk, oh, ow, oc_block] + data_pad[n, ic // T.int64(3), oh + kh, ow + kw, ic % T.int64(3)] * placeholder_1[oc_chunk, ic // T.int64(3), kh, kw, ic % T.int64(3), oc_block] # type: ignore
 
     # fmt: on
     # pylint: enable=invalid-name,no-member,line-too-long,too-many-nested-blocks,no-self-argument
@@ -545,7 +589,9 @@ def test_meta_schedule_te2primfunc_argument_order_and_lowering():
         dev,
     )
 
-    with target, _create_verification_database(), PassContext(  # pylint: disable=not-context-manager
+    with (
+        target
+    ), _create_verification_database(), PassContext(  # pylint: disable=not-context-manager
         opt_level=3,
         config={
             "relay.backend.use_meta_schedule": True,
@@ -571,6 +617,7 @@ def test_meta_schedule_te2primfunc_argument_order_and_lowering():
     assert np.allclose(actual_output, expected_output, rtol=1e-4, atol=2e-4)
 
 
+@pytest.mark.skip("Integration tests")
 def test_rewrite_layout_link_params():
     I, O, H, W = 64, 64, 56, 56
     kH = kW = 3
@@ -649,6 +696,7 @@ def test_rewrite_layout_link_params():
         np.testing.assert_allclose(ref, out, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.skip("Integration tests")
 def test_module_equality_ignore_ndarray():
     target = "llvm --num-cores=4"
 
@@ -708,7 +756,7 @@ def test_module_equality_ignore_ndarray():
     np.testing.assert_allclose(ref, out, rtol=1e-4, atol=1e-4)
 
 
-def _test_anchor_tuning(target):
+def _test_anchor_tuning(target, space):
     data_shape = (128, 128)
     weight_shape1 = (128, 128)
     weight_shape2 = (128, 128)
@@ -740,9 +788,11 @@ def _test_anchor_tuning(target):
             target=target,
             params=params,
             work_dir=work_dir,
+            space=space,
             max_trials_global=4,
             strategy="replay-trace",
             module_equality=module_equality,
+            num_tuning_cores=4,
         )
         lib = ms.relay_integration.compile_relay(database, mod, target, params)
 
@@ -762,10 +812,19 @@ def _test_anchor_tuning(target):
     np.testing.assert_allclose(ref, out, atol=1e-3)
 
 
-def test_anchor_tuning_cpu():
-    _test_anchor_tuning("llvm --num-cores=4")
+@pytest.mark.skip("Integration tests")
+@pytest.mark.parametrize(
+    "space",
+    [
+        ms.space_generator.PostOrderApply(),
+        ms.space_generator.PostOrderApply(sch_rules=[], postprocs=[], mutator_probs={}),
+    ],
+)
+def test_anchor_tuning_cpu(space):
+    _test_anchor_tuning("llvm --num-cores=4", space)
 
 
+@pytest.mark.skip("Integration tests")
 def test_anchor_tuning_cpu_link_params():
     data_shape = (128, 128)
     weight_shape1 = (128, 128)
@@ -816,6 +875,127 @@ def test_anchor_tuning_cpu_link_params():
     )
 
     np.testing.assert_allclose(ref, out, atol=1e-3)
+
+
+@pytest.mark.skip("Integration tests")
+@pytest.mark.xfail(raises=tvm.error.TVMError)
+def test_disabled_pass_param():
+    """
+    Check 'disabled_pass' parameter in tune_relay. Should throw exception in
+    case of correct work.
+    """
+    data_shape = [1, 4, 16, 16]
+    weight_shape = [32, 4, 2, 2]
+
+    data = relay.var("data", shape=data_shape, dtype="uint8")
+    weight = relay.var("weight", shape=weight_shape, dtype="int8")
+
+    op = relay.qnn.op.conv2d(
+        data,
+        weight,
+        input_zero_point=relay.const(0),
+        kernel_zero_point=relay.const(0),
+        input_scale=relay.const(0.7),
+        kernel_scale=relay.const(0.3),
+        kernel_size=[2, 2],
+        channels=32,
+    )
+    mod = tvm.IRModule.from_expr(op)
+
+    weight_np = np.random.randint(-10, 10, size=weight_shape).astype("int8")
+    params = {"weight": weight_np}
+
+    executor = relay.backend.Executor("graph", {"link-params": True})
+    mod = mod.with_attr("executor", executor)
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        database = ms.relay_integration.tune_relay(
+            mod=mod,
+            target="llvm --num-cores=4",
+            params=params,
+            work_dir=work_dir,
+            max_trials_global=4,
+            strategy="replay-trace",
+            disabled_pass=["qnn.Legalize"],
+        )
+
+    # Test failed, otherwise we can not reach this point.
+    pytest.fail("'disabled_pass' argument does not work")
+
+
+@pytest.mark.skip("Integration tests")
+def test_rewrite_layout_link_params_1x1_conv2d():
+    I, O, H, W = 32, 16, 256, 256
+    kH = kW = 1
+
+    strides = (1, 1)
+    padding = (0, 0)
+
+    data_shape = (1, H, W, I)
+    w_shape = (kH, kW, I, O)
+
+    data = relay.var("data", shape=data_shape, dtype="float32")
+    weight = relay.var("weight", shape=w_shape, dtype="float32")
+
+    conv = relay.nn.conv2d(
+        data=data,
+        weight=weight,
+        kernel_size=(kH, kW),
+        channels=O,
+        padding=padding,
+        strides=strides,
+        data_layout="NHWC",
+        kernel_layout="HWIO",
+        out_dtype="float32",
+    )
+
+    mod = tvm.IRModule.from_expr(conv)
+
+    weight_np = np.random.randn(*w_shape).astype("float32")
+
+    params = {"weight": weight_np}
+
+    data_np = np.random.randn(*data_shape).astype("float32")
+
+    ref = (
+        relay.create_executor("graph", mod=mod, device=tvm.cpu(0), target="llvm")
+        .evaluate()(*[data_np, weight_np])
+        .numpy()
+    )
+
+    link_params = True
+
+    target = "llvm --num-cores=4"
+
+    executor = relay.backend.Executor("graph", {"link-params": link_params})
+    mod = mod.with_attr("executor", executor)
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        database = ms.relay_integration.tune_relay(
+            mod=mod,
+            target=target,
+            params=params,
+            work_dir=work_dir,
+            max_trials_global=8,
+            strategy="replay-trace",
+        )
+
+        lib = ms.relay_integration.compile_relay(
+            database=database,
+            mod=mod,
+            target=target,
+            params=params,
+        )
+
+    dev = tvm.device(target, 0)
+    runtime = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
+
+    runtime.set_input("data", data_np)
+    runtime.run()
+
+    out = runtime.get_output(0).numpy()
+
+    np.testing.assert_allclose(ref, out, rtol=1e-4, atol=1e-4)
 
 
 if __name__ == "__main__":

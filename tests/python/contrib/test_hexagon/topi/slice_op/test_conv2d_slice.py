@@ -24,8 +24,9 @@ import tvm
 import tvm.testing
 from tvm.topi.hexagon.slice_ops.conv2d import conv2d_compute, conv2d_schedule
 from tvm.topi.testing import conv2d_nhwc_python
+from tvm.contrib.hexagon import allocate_hexagon_array
 
-from ...infrastructure import allocate_hexagon_array, transform_numpy, get_hexagon_target
+from ...infrastructure import transform_numpy, get_hexagon_target
 
 input_layout = tvm.testing.parameter(
     "nhwc-8h2w32c2w-2d",
@@ -109,7 +110,9 @@ def padded_filt_shape(filt_shape):
 def weights_np_padded(weights_np, filt_shape, padded_filt_shape):
     pad_in_channels = padded_filt_shape[2] - filt_shape[2]
     pad_out_channels = padded_filt_shape[3] - filt_shape[3]
-    filt_padded = np.pad(weights_np, ((0, 0), (0, 0), (0, pad_in_channels), (0, pad_out_channels)))
+    filt_padded = np.pad(
+        weights_np, ((0, 0), (0, 0), (0, pad_in_channels), (0, pad_out_channels)), "constant"
+    )
     return filt_padded
 
 
